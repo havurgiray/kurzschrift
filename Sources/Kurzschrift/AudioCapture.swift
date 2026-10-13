@@ -196,6 +196,42 @@ final class SystemAudioSource: AudioOutputHandler {
   }
 }
 
+// MARK: - Audio file (testing)
+
+/// Plays an audio file into a track in real time instead of capturing system audio
+/// (kurzschrift://start?mode=…&audio=/path/file.wav), so a whole meeting can be replayed without
+/// any recording permission.
+final class FileAudioSource: @unchecked Sendable {
+  private let track: Track
+  private let url: URL
+  private var task: Task<Void, Never>?
+
+  init(track: Track, url: URL) {
+    self.track = track
+    self.url = url
+  }
+
+  func start() throws {
+    let file = try AVAudioFile(forReading: url)
+    let track = track
+    task = Task.detached(priority: .userInitiated) {
+      let chunk = AVAudioFrameCount(file.processingFormat.sampleRate / 10)
+      while !Task.isCancelled, file.framePosition < file.length {
+        let frames = min(chunk, AVAudioFrameCount(file.length - file.framePosition))
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames),
+          (try? file.read(into: buffer, frameCount: frames)) != nil
+        else { break }
+        track.receive(buffer)
+        try? await Task.sleep(for: .milliseconds(100))
+      }
+    }
+  }
+
+  func stop() {
+    task?.cancel()
+  }
+}
+
 // MARK: - Microphone
 
 final class MicrophoneSource {
