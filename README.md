@@ -19,12 +19,23 @@ Click the speech-bubble icon in the menu bar:
 
 - **Translate Meeting (German → English)** (⌘1) or **Transcribe Meeting (English)** (⌘2) starts recording.
 - **Stop and Save** (⌘S) finishes recording. Speakers are identified and the final transcript is written, which takes a few seconds.
+- **Bookmark This Moment** (⌘B) marks "this was important" with a ⭐ in the transcript and the minutes.
 - **Show Live Window** (⌘L) opens the meeting window (below).
+- **Subtitles** (⌘T) shows TV-style captions along the bottom of the screen while recording. Clicks pass straight through them.
 - **Export Transcript** saves or copies the transcript as it stands right now, even mid-meeting.
 - **Live Update Interval** sets how often the live translation line and the clock refresh (default 500 ms).
 - **Open Last Transcript**, **Open Transcripts Folder**, **Settings…**
 
 While recording, the menu bar shows the elapsed time.
+
+**Global shortcuts** (work in any app): ⌃⌥T starts or stops translating, ⌃⌥R starts or stops
+transcribing, and ⌃⌥B adds a bookmark.
+
+**Automatic start and stop** (Settings → Meetings):
+
+- When Teams, Zoom, Webex, FaceTime, Slack or Discord starts using the microphone, a notification offers **Translate** or **Transcribe**. When the call ends, the recording stops and saves.
+- A recording nobody has spoken in for 10 minutes stops and saves by itself. The window counts down the last minute and has a **Keep Recording** button.
+- If a calendar event is happening, the file is named after it and the attendee list goes into the front matter and the minutes.
 
 ### The meeting window
 
@@ -32,7 +43,9 @@ A floating window that stays on top, even over full-screen Teams:
 
 - **Live captions** (bottom strip): what is being said right now, in the original language as the recognizer hears it. When translating, the English is underneath.
 - **Transcript** (left): the whole meeting so far. For translations, the original is in grey above the English. It follows new lines; scroll up to read back and it stays put until you press **Jump to latest**.
-- **Minutes** (right, when live minutes are on): updated at the interval you choose, with **Update now**, a copy button, the time of the next update and the estimated API cost.
+- **Minutes** (right, when live minutes are on): updated at the interval you choose, with **Update now**, a copy button, the time of the next update and the estimated API cost. The checklist button adds the action items to Apple Reminders; you pick which, and due dates like "by Friday" are recognized.
+- **Ask** (right, with an API key): questions about the meeting so far ("what did they decide about the budget?"), answered from the transcript with timestamps. Questions and answers are saved in the file.
+- **Speaker names**: after the meeting, click "Speaker 2" to rename them everywhere, in the window, the file and the minutes. With **Remember this voice** on, that person is named automatically in later meetings. Remembered voices are listed in Settings → General → Speakers.
 - **Export** (header): save as Markdown or text, or copy to the clipboard. Includes the transcript, translation and current minutes.
 
 Transcripts are saved to `~/Documents/Meeting Transcripts/`, named like
@@ -53,6 +66,11 @@ language otherwise. **Extra instructions** let you steer them (e.g. "focus on my
 - **Cost:** the transcript is sent so that everything already sent is read from the provider's prompt cache. The pane shows an estimate; with `claude-opus-5-5` a one-hour meeting at 3-minute updates costs around a dollar, and `claude-haiku-5-5` costs a few cents.
 - **Key storage:** keys are stored in `~/Library/Application Support/Kurzschrift/api-keys.json`, readable only by your user account. They're deliberately not in the keychain: the app is signed ad hoc, so the keychain would ask for your password after every rebuild.
 
+### Getting names and languages right
+
+- **Vocabulary** (Settings → General): names and terms that keep getting misheard (product names, acronyms, colleagues' names). They go to Apple's speech recognizer and to the minutes.
+- **Mixed-language meetings** (Settings → Translate / Transcribe → "Sometimes also"): a second recognizer listens in parallel, and for each sentence the one that understood it is kept. Its own confidence is blended with Apple's on-device language detection. English sentences in a translated German meeting are kept as spoken instead of being translated. It's on for translated meetings (also English) and off for transcribed ones. In this mode finished lines appear a little later, because both recognizers have to finish; the live captions are immediate.
+
 ### Start/stop from Shortcuts, Raycast or a hotkey tool
 
 ```
@@ -61,6 +79,9 @@ open "kurzschrift://start?mode=transcribe"
 open "kurzschrift://stop"
 open "kurzschrift://toggle?mode=translate"
 open "kurzschrift://minutes"     # update the minutes now
+open "kurzschrift://bookmark"
+open "kurzschrift://ask?q=What%20did%20we%20decide%3F"
+open "kurzschrift://rename?from=Speaker%202&to=Maria"   # after a meeting; &remember=no to skip the voice
 ```
 
 ## How it works (all on this Mac)
@@ -95,6 +116,13 @@ Screen & System Audio Recording.
 Translation needs the languages downloaded: System Settings → General → Language & Region →
 Translation Languages. The Translate tab in Settings shows whether they are installed.
 
+Optional features ask once when first used:
+- **Notifications:** for call detection.
+- **Calendar:** when a meeting starts, to find the current event.
+- **Reminders:** when you add action items.
+
+All of them stay on the Mac. Voices you name are stored in `~/Library/Application Support/Kurzschrift/voices.json`.
+
 ## Build
 
 ```bash
@@ -111,9 +139,12 @@ is built without its NeMo text-processing binary, so nothing is fetched from Git
 
   ```bash
   "~/Applications/Kurzschrift.app/Contents/MacOS/Kurzschrift" --reprocess --mode transcribe \
-      --system "… (meeting audio).wav" --mic "… (microphone).wav" --out ~/Desktop [--verbose]
+      --system "… (meeting audio).wav" --mic "… (microphone).wav" --out ~/Desktop \
+      [--language de-DE] [--also en-US|none] [--start 2026-09-30T10:20:52+02:00] [--verbose]
   ```
+
+  `--language` and `--also` override the spoken languages, and `--start` sets the meeting's original start time for the file.
 - Developer hooks:
   - `kurzschrift://start?mode=translate&audio=/path/meeting.wav` replays a recording through the live pipeline instead of capturing audio, which needs no permissions.
-  - `kurzschrift://snapshot?path=/tmp/window.png` draws the meeting window's own view to a PNG.
+  - `kurzschrift://snapshot?path=/tmp/window.png` (or `&window=subtitles`) draws the meeting window's or the subtitle bar's own view to a PNG.
   - `defaults write local.kurzschrift minutesBaseURL.anthropic http://localhost:8765` (or `.openai`) points the minutes requests at a local mock server.
