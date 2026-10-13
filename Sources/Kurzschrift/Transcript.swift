@@ -75,7 +75,7 @@ enum TranscriptBuilder {
   private static let unknownSpeaker = "?"
 
   private static func piece(_ label: String?, _ words: [TimedWord]) -> (label: String?, start: Double, end: Double, text: String) {
-    let text = words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+    let text = TextCleanup.tidy(words.map(\.text).joined())
     return (label, words.first?.start ?? 0, words.last?.end ?? 0, text)
   }
 
@@ -197,9 +197,16 @@ final class TranscriptDocument {
 
   var baseName: String { url.deletingPathExtension().lastPathComponent }
 
-  func writeDraft(entries: [SessionController.LiveEntry]) {
+  func writeDraft(entries: [SessionController.LiveEntry], minutes: String? = nil) {
+    write(draftMarkdown(entries: entries, minutes: minutes))
+  }
+
+  func draftMarkdown(entries: [SessionController.LiveEntry], minutes: String?) -> String {
     var md = header(endedAt: nil, speakers: [])
     md += "_Recording in progress. Speakers are identified when the recording stops._\n\n"
+    if let minutes, !minutes.isEmpty {
+      md += "## Minutes (live draft)\n\n\(minutes)\n\n## Transcript\n\n"
+    }
     for entry in entries {
       md += heading(entry.speaker, entry.start)
       if config.mode == .translate {
@@ -208,16 +215,20 @@ final class TranscriptDocument {
         md += "\(entry.original)\n\n"
       }
     }
-    write(md)
+    return md
   }
 
-  func writeFinal(turns: [Turn], endedAt: Date, notes: [String], audioFiles: [URL]) {
+  func writeFinal(turns: [Turn], endedAt: Date, notes: [String], audioFiles: [URL], minutes: String? = nil) {
     let speakers = turns.compactMap(\.speaker).filter { $0 != "Unknown speaker" }
       .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
     var md = header(endedAt: endedAt, speakers: speakers)
     for note in notes { md += "> [!note]\n> \(note)\n\n" }
     if !audioFiles.isEmpty {
       md += "Audio: " + audioFiles.map { "[\($0.lastPathComponent)](<\($0.lastPathComponent)>)" }.joined(separator: ", ") + "\n\n"
+    }
+    if let minutes, !minutes.isEmpty {
+      md += "## Minutes\n\n\(minutes)\n\n"
+      if !(config.mode == .translate && config.layout == .sections) { md += "## Transcript\n\n" }
     }
     if turns.isEmpty { md += "_No speech was recognized._\n" }
 

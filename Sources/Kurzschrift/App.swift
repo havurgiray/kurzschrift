@@ -38,8 +38,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     Task { @MainActor in
       let session = SessionController.shared
       switch action {
-      case "start": if let mode { await session.start(mode) }
+      case "start":
+        let audio = components.queryItems?.first { $0.name == "audio" }?.value.map { URL(fileURLWithPath: $0) }
+        if let mode { await session.start(mode, testAudio: audio) }
       case "stop": await session.stop()
+      case "minutes": session.updateMinutesNow()
+      case "snapshot":
+        if let path = components.queryItems?.first(where: { $0.name == "path" })?.value {
+          LiveWindowController.shared.snapshot(to: path)
+        }
       case "toggle":
         if session.isRecording { await session.stop() } else if let mode { await session.start(mode) }
       default: break
@@ -112,6 +119,13 @@ private struct MenuContent: View {
     Divider()
     Button("Show Live Window") { LiveWindowController.shared.show() }
       .keyboardShortcut("l")
+    if session.canExport {
+      Menu("Export Transcript") {
+        Button("Save as Markdown…") { session.exportWithSavePanel(.markdown) }
+        Button("Save as Text…") { session.exportWithSavePanel(.text) }
+        Button("Copy to Clipboard") { session.copyToClipboard() }
+      }
+    }
     Button("Open Last Transcript") {
       if let url = session.lastTranscript { NSWorkspace.shared.open(url) }
     }
