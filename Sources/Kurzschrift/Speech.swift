@@ -17,6 +17,9 @@ struct FinalSegment: Identifiable {
   let start: Double
   let end: Double
   var words: [TimedWord]
+  /// The recognizer's language ("de_DE") and its average confidence (0...1), for mixed meetings.
+  var locale = ""
+  var confidence = 0.0
 }
 
 /// The recognizer sometimes starts a result with the punctuation that ends the previous one
@@ -42,7 +45,7 @@ enum TextCleanup {
 }
 
 enum SpeechEvent {
-  case partial(AudioSourceKind, String)
+  case partial(AudioSourceKind, String, locale: String)
   case final(FinalSegment)
 }
 
@@ -63,6 +66,7 @@ enum SpeechError: LocalizedError {
 /// Apple's on-device SpeechAnalyzer for one audio source.
 final class SpeechPipeline: @unchecked Sendable {
   let source: AudioSourceKind
+  let locale: Locale
   private let transcriber: SpeechTranscriber
   private let analyzer: SpeechAnalyzer
   private let inputContinuation: AsyncStream<AnalyzerInput>.Continuation
@@ -71,10 +75,11 @@ final class SpeechPipeline: @unchecked Sendable {
   private var resultsTask: Task<Void, Never>?
 
   private init(
-    source: AudioSourceKind, transcriber: SpeechTranscriber, analyzer: SpeechAnalyzer,
+    source: AudioSourceKind, locale: Locale, transcriber: SpeechTranscriber, analyzer: SpeechAnalyzer,
     inputContinuation: AsyncStream<AnalyzerInput>.Continuation, analyzerFormat: AVAudioFormat
   ) {
     self.source = source
+    self.locale = locale
     self.transcriber = transcriber
     self.analyzer = analyzer
     self.inputContinuation = inputContinuation
@@ -95,7 +100,8 @@ final class SpeechPipeline: @unchecked Sendable {
     return supported
   }
 
-  static func make(source: AudioSourceKind, locale: Locale) async throws -> SpeechPipeline {
+  /// `vocabulary`: names and terms the recognizer should expect (Settings → General → Vocabulary).
+  static func make(source: AudioSourceKind, locale: Locale, vocabulary: [String] = []) async throws -> SpeechPipeline {
     let transcriber = makeTranscriber(locale: locale)
     guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
       throw SpeechError.noAudioFormat
@@ -103,22 +109,28 @@ final class SpeechPipeline: @unchecked Sendable {
     let analyzer = SpeechAnalyzer(
       modules: [transcriber], options: .init(priority: .userInitiated, modelRetention: .processLifetime))
     try await analyzer.prepareToAnalyze(in: format)
+    if !vocabulary.isEmpty {
+      let context = AnalysisContext()
+      context.contextualStrings[.general] = vocabulary
+      try await analyzer.setContext(context)
+    }
     let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
     try await analyzer.start(inputSequence: stream)
     return SpeechPipeline(
-      source: source, transcriber: transcriber, analyzer: analyzer, inputContinuation: continuation,
+      source: source, locale: locale, transcriber: transcriber, analyzer: analyzer, inputContinuation: continuation,
       analyzerFormat: format)
   }
 
   private static func makeTranscriber(locale: Locale) -> SpeechTranscriber {
     SpeechTranscriber(
       locale: locale, transcriptionOptions: [], reportingOptions: [.volatileResults, .fastResults],
-      attributeOptions: [.audioTimeRange])
+      attributeOptions: [.audioTimeRange, .transcriptionConfidence])
   }
 
   func start(onEvent: @escaping @Sendable (SpeechEvent) async -> Void) {
     let source = source
     let transcriber = transcriber
+    let localeID = locale.identifier
     resultsTask = Task {
       Log.write("\(source) speech results: listening")
       do {
@@ -129,9 +141,12 @@ final class SpeechPipeline: @unchecked Sendable {
             let words = Self.words(in: result.text)
             let start = words.first?.start ?? result.range.start.seconds
             let end = words.last?.end ?? result.range.end.seconds
-            await onEvent(.final(FinalSegment(source: source, text: text, start: start, end: end, words: words)))
+            var segment = FinalSegment(source: source, text: text, start: start, end: end, words: words)
+            segment.locale = localeID
+            segment.confidence = Self.confidence(of: result.text)
+            await onEvent(.final(segment))
           } else {
-            await onEvent(.partial(source, text))
+            await onEvent(.partial(source, text, locale: localeID))
           }
         }
       } catch {
@@ -166,6 +181,11 @@ final class SpeechPipeline: @unchecked Sendable {
     if error == nil, out.frameLength > 0 { inputContinuation.yield(AnalyzerInput(buffer: out)) }
   }
 
+  /// Audio time (seconds) up to which results are final; nil when nothing is pending.
+  func finalizedThrough() async -> Double? {
+    await analyzer.volatileRange?.start.seconds
+  }
+
   /// Ends the input and waits until the last words have been finalized and delivered.
   func finish() async {
     inputContinuation.finish()
@@ -175,6 +195,19 @@ final class SpeechPipeline: @unchecked Sendable {
       Log.write("finalizing \(source) speech failed: \(error)")
     }
     await resultsTask?.value
+  }
+
+  /// Character-weighted mean of the recognizer's per-word confidence.
+  private static func confidence(of text: AttributedString) -> Double {
+    var total = 0.0
+    var weight = 0.0
+    for run in text.runs {
+      guard let value = run[AttributeScopes.SpeechAttributes.ConfidenceAttribute.self] else { continue }
+      let length = Double(text[run.range].characters.count)
+      total += value * length
+      weight += length
+    }
+    return weight > 0 ? total / weight : 0.5
   }
 
   private static func words(in text: AttributedString) -> [TimedWord] {
