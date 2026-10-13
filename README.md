@@ -19,16 +19,39 @@ Click the speech-bubble icon in the menu bar:
 
 - **Translate Meeting (German → English)** (⌘1) or **Transcribe Meeting (English)** (⌘2) starts recording.
 - **Stop and Save** (⌘S) finishes recording. Speakers are identified and the final transcript is written, which takes a few seconds.
-- **Show Live Window** (⌘L) opens a floating window that stays on top, even over full-screen Teams.
-- **Live Update Interval** sets how often the in-progress translation line and the clock refresh (default 500 ms).
+- **Show Live Window** (⌘L) opens the meeting window (below).
+- **Export Transcript** saves or copies the transcript as it stands right now, even mid-meeting.
+- **Live Update Interval** sets how often the live translation line and the clock refresh (default 500 ms).
 - **Open Last Transcript**, **Open Transcripts Folder**, **Settings…**
 
 While recording, the menu bar shows the elapsed time.
+
+### The meeting window
+
+A floating window that stays on top, even over full-screen Teams:
+
+- **Live captions** (bottom strip): what is being said right now, in the original language as the recognizer hears it. When translating, the English is underneath.
+- **Transcript** (left): the whole meeting so far. For translations, the original is in grey above the English. It follows new lines; scroll up to read back and it stays put until you press **Jump to latest**.
+- **Minutes** (right, when live minutes are on): updated at the interval you choose, with **Update now**, a copy button, the time of the next update and the estimated API cost.
+- **Export** (header): save as Markdown or text, or copy to the clipboard. Includes the transcript, translation and current minutes.
 
 Transcripts are saved to `~/Documents/Meeting Transcripts/`, named like
 `2026-09-17 14-05 German meeting (translated).md`. During the meeting the file is kept up to date as
 a draft. When you stop, it is replaced with the final version, which includes speaker names. Quitting
 the app mid-meeting saves first.
+
+### Live minutes (optional, uses an API key)
+
+Settings → **Minutes** turns on minutes for translated and/or transcribed meetings. Choose Anthropic
+(default model `claude-opus-5-5`) or OpenAI, paste an API key, and press **Test Key**. That checks
+the key and lists the models it can use. During the meeting the minutes are rewritten at the chosen
+interval (default 3 minutes). When you stop, final minutes with speaker names are written at the top
+of the transcript file. Minutes are written in English for translated meetings and in the meeting's
+language otherwise. **Extra instructions** let you steer them (e.g. "focus on my action items").
+
+- **Privacy:** this is the only feature that sends anything off the Mac. The transcript text, not audio, goes to the provider you chose, and only while minutes are on.
+- **Cost:** the transcript is sent so that everything already sent is read from the provider's prompt cache. The pane shows an estimate; with `claude-opus-5-5` a one-hour meeting at 3-minute updates costs around a dollar, and `claude-haiku-5-5` costs a few cents.
+- **Key storage:** keys are stored in `~/Library/Application Support/Kurzschrift/api-keys.json`, readable only by your user account. They're deliberately not in the keychain: the app is signed ad hoc, so the keychain would ask for your password after every rebuild.
 
 ### Start/stop from Shortcuts, Raycast or a hotkey tool
 
@@ -37,6 +60,7 @@ open "kurzschrift://start?mode=translate"
 open "kurzschrift://start?mode=transcribe"
 open "kurzschrift://stop"
 open "kurzschrift://toggle?mode=translate"
+open "kurzschrift://minutes"     # update the minutes now
 ```
 
 ## How it works (all on this Mac)
@@ -89,3 +113,7 @@ is built without its NeMo text-processing binary, so nothing is fetched from Git
   "~/Applications/Kurzschrift.app/Contents/MacOS/Kurzschrift" --reprocess --mode transcribe \
       --system "… (meeting audio).wav" --mic "… (microphone).wav" --out ~/Desktop [--verbose]
   ```
+- Developer hooks:
+  - `kurzschrift://start?mode=translate&audio=/path/meeting.wav` replays a recording through the live pipeline instead of capturing audio, which needs no permissions.
+  - `kurzschrift://snapshot?path=/tmp/window.png` draws the meeting window's own view to a PNG.
+  - `defaults write local.kurzschrift minutesBaseURL.anthropic http://localhost:8765` (or `.openai`) points the minutes requests at a local mock server.
