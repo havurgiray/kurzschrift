@@ -7,6 +7,8 @@ struct Turn {
   var end: Double
   /// Original text in pieces as recognized; translated piece by piece (cached from the live view).
   var pieces: [String]
+  /// The recognizer language of each piece (mixed-language meetings translate only the others).
+  var languages: [String] = []
   var translation: String?
 
   var text: String { pieces.joined(separator: " ") }
@@ -17,19 +19,28 @@ enum TranscriptBuilder {
   static func turns(
     segments: [FinalSegment], speakers: [AudioSourceKind: [SpeakerSpan]], config: SessionConfig
   ) -> [Turn] {
+    build(segments: segments, speakers: speakers, config: config, knownNames: [:]).turns
+  }
+
+  /// `knownNames`: "source:speakerId" → a remembered person's name. Returns the turns and the name
+  /// each diarized speaker ended up with ("source:speakerId" → "Speaker 2" or "Maria").
+  static func build(
+    segments: [FinalSegment], speakers: [AudioSourceKind: [SpeakerSpan]], config: SessionConfig,
+    knownNames: [String: String]
+  ) -> (turns: [Turn], speakerNames: [String: String]) {
     let segments = removingEcho(segments.sorted { $0.start < $1.start })
     let bothSources = Set(segments.map(\.source)).count > 1 || config.includeMic
 
     // 1. Label every word, then cut segments where the speaker changes.
-    var pieces: [(label: String?, start: Double, end: Double, text: String)] = []
+    var pieces: [(label: String?, start: Double, end: Double, text: String, language: String)] = []
     for segment in segments {
       if segment.source == .microphone, !(config.micShared && speakers[.microphone] != nil) {
-        pieces.append((config.myName, segment.start, segment.end, segment.text))
+        pieces.append((config.myName, segment.start, segment.end, segment.text, segment.locale))
         continue
       }
       guard let spans = speakers[segment.source], !spans.isEmpty, !segment.words.isEmpty else {
         let label: String? = segment.source == .microphone ? config.myName : (bothSources ? "Others" : nil)
-        pieces.append((label, segment.start, segment.end, segment.text))
+        pieces.append((label, segment.start, segment.end, segment.text, segment.locale))
         continue
       }
       // Word start times swallow the silence before a sentence ("Okay" timed from the previous
@@ -41,19 +52,27 @@ enum TranscriptBuilder {
         if let open = current, open.label == label {
           current!.words.append(word)
         } else {
-          if let open = current { pieces.append(piece(open.label, open.words)) }
+          if let open = current { pieces.append(piece(open.label, open.words, segment.locale)) }
           current = (label, [word])
         }
       }
-      if let open = current { pieces.append(piece(open.label, open.words)) }
+      if let open = current { pieces.append(piece(open.label, open.words, segment.locale)) }
     }
     pieces.sort { $0.start < $1.start }
 
     // 2. Name diarized speakers "Speaker 1, 2, ..." in order of first appearance.
     var names: [String: String] = [:]
+    var numbered = 0
     for p in pieces {
       guard let label = p.label, label.contains(":"), names[label] == nil else { continue }
-      names[label] = label.hasSuffix(":\(unknownSpeaker)") ? "Unknown speaker" : "Speaker \(names.values.filter { $0 != "Unknown speaker" }.count + 1)"
+      if let known = knownNames[label] {
+        names[label] = known
+      } else if label.hasSuffix(":\(unknownSpeaker)") {
+        names[label] = "Unknown speaker"
+      } else {
+        numbered += 1
+        names[label] = "Speaker \(numbered)"
+      }
     }
 
     // 3. Merge consecutive pieces from the same speaker.
@@ -62,21 +81,24 @@ enum TranscriptBuilder {
       let name = p.label.map { names[$0] ?? $0 }
       if var last = turns.last, last.speaker == name, p.start - last.end < 30 {
         last.pieces.append(p.text)
+        last.languages.append(p.language)
         last.end = max(last.end, p.end)
         turns[turns.count - 1] = last
       } else {
-        turns.append(Turn(speaker: name, start: p.start, end: p.end, pieces: [p.text]))
+        turns.append(Turn(speaker: name, start: p.start, end: p.end, pieces: [p.text], languages: [p.language]))
       }
     }
-    return turns
+    return (turns, names)
   }
 
   /// Speech that speaker detection didn't cover (very quiet or very short).
   private static let unknownSpeaker = "?"
 
-  private static func piece(_ label: String?, _ words: [TimedWord]) -> (label: String?, start: Double, end: Double, text: String) {
+  private static func piece(_ label: String?, _ words: [TimedWord], _ language: String)
+    -> (label: String?, start: Double, end: Double, text: String, language: String)
+  {
     let text = TextCleanup.tidy(words.map(\.text).joined())
-    return (label, words.first?.start ?? 0, words.last?.end ?? 0, text)
+    return (label, words.first?.start ?? 0, words.last?.end ?? 0, text, language)
   }
 
   /// Between two speakers' spans: speaker detection trims the tail of a turn, so a word shortly
@@ -208,6 +230,10 @@ final class TranscriptDocument {
       md += "## Minutes (live draft)\n\n\(minutes)\n\n## Transcript\n\n"
     }
     for entry in entries {
+      if entry.isBookmark {
+        md += Self.bookmarkMarkdown(entry.start)
+        continue
+      }
       md += heading(entry.speaker, entry.start)
       if config.mode == .translate {
         md += "> \(entry.original)\n\n\(entry.translation ?? "")\n\n"
@@ -218,7 +244,20 @@ final class TranscriptDocument {
     return md
   }
 
-  func writeFinal(turns: [Turn], endedAt: Date, notes: [String], audioFiles: [URL], minutes: String? = nil) {
+  func writeFinal(
+    turns: [Turn], endedAt: Date, notes: [String], audioFiles: [URL], minutes: String? = nil, bookmarks: [Double] = [],
+    qa: [(question: String, answer: String)] = []
+  ) {
+    var pending = bookmarks.sorted()
+    /// Bookmarks that fall before `time` and haven't been written yet.
+    func marks(before time: Double) -> String {
+      var md = ""
+      while let next = pending.first, next <= time {
+        md += Self.bookmarkMarkdown(next)
+        pending.removeFirst()
+      }
+      return md
+    }
     let speakers = turns.compactMap(\.speaker).filter { $0 != "Unknown speaker" }
       .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
     var md = header(endedAt: endedAt, speakers: speakers)
@@ -228,23 +267,31 @@ final class TranscriptDocument {
     }
     if let minutes, !minutes.isEmpty {
       md += "## Minutes\n\n\(minutes)\n\n"
-      if !(config.mode == .translate && config.layout == .sections) { md += "## Transcript\n\n" }
+    }
+    if !qa.isEmpty {
+      md += "## Questions\n\n"
+      for item in qa { md += "**Q: \(item.question)**\n\n\(item.answer)\n\n" }
+    }
+    if (minutes?.isEmpty == false || !qa.isEmpty), !(config.mode == .translate && config.layout == .sections) {
+      md += "## Transcript\n\n"
     }
     if turns.isEmpty { md += "_No speech was recognized._\n" }
 
     switch (config.mode, config.layout) {
     case (.transcribe, _):
-      for turn in turns { md += heading(turn.speaker, turn.start) + "\(turn.text)\n\n" }
+      for turn in turns { md += marks(before: turn.start) + heading(turn.speaker, turn.start) + "\(turn.text)\n\n" }
     case (.translate, .interleaved):
       for turn in turns {
-        md += heading(turn.speaker, turn.start) + "> \(turn.text)\n\n\(turn.translation ?? "_(not translated)_")\n\n"
+        md += marks(before: turn.start) + heading(turn.speaker, turn.start)
+          + "> \(turn.text)\n\n\(turn.translation ?? "_(not translated)_")\n\n"
       }
     case (.translate, .sections):
       md += "## \(AppSettings.languageName(config.spokenLocale.identifier)) (original)\n\n"
-      for turn in turns { md += heading(turn.speaker, turn.start) + "\(turn.text)\n\n" }
+      for turn in turns { md += marks(before: turn.start) + heading(turn.speaker, turn.start) + "\(turn.text)\n\n" }
       md += "## \(targetName) (translation)\n\n"
       for turn in turns { md += heading(turn.speaker, turn.start) + "\(turn.translation ?? "_(not translated)_")\n\n" }
     }
+    md += marks(before: .infinity)
     write(md)
   }
 
@@ -271,6 +318,12 @@ final class TranscriptDocument {
     if !speakers.isEmpty {
       front += "speakers: [" + speakers.map { "\"\($0)\"" }.joined(separator: ", ") + "]\n"
     }
+    if let event = config.eventTitle {
+      front += "event: \"\(event.replacingOccurrences(of: "\"", with: "'"))\"\n"
+    }
+    if !config.attendees.isEmpty {
+      front += "attendees: [" + config.attendees.map { "\"\($0)\"" }.joined(separator: ", ") + "]\n"
+    }
     front += "---\n\n"
     let title = "# \(Self.kindTitle(config)), \(Self.titleDate.string(from: startedAt))\n\n"
     return front + title
@@ -289,12 +342,22 @@ final class TranscriptDocument {
     }
   }
 
+  static func bookmarkMarkdown(_ seconds: Double) -> String {
+    "**⭐ Bookmark** · \(clock(seconds))\n\n"
+  }
+
   static func clock(_ seconds: Double) -> String {
     let s = max(0, Int(seconds))
     return String(format: "%02d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
   }
 
   private static func kindTitle(_ config: SessionConfig) -> String {
+    if let event = config.eventTitle {
+      let safe = event.components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>")).joined(separator: "-")
+        .trimmingCharacters(in: .whitespaces)
+      let short = safe.count > 80 ? String(safe.prefix(80)) : safe
+      return config.mode == .translate ? "\(short) (translated)" : short
+    }
     let spoken = AppSettings.languageName(config.spokenLocale.identifier)
     switch config.mode {
     case .translate: return "\(spoken) meeting (translated)"

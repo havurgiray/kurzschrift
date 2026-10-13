@@ -10,6 +10,8 @@ struct SettingsView: View {
     TabView {
       GeneralSettings(settings: settings)
         .tabItem { Label("General", systemImage: "gearshape") }
+      MeetingsSettings(settings: settings)
+        .tabItem { Label("Meetings", systemImage: "calendar.badge.clock") }
       TranslationSettings(settings: settings)
         .tabItem { Label("Translate", systemImage: "character.bubble") }
       TranscriptionSettings(settings: settings)
@@ -40,6 +42,15 @@ private struct GeneralSettings: View {
         Toggle("Also keep the audio recording (WAV) next to each transcript", isOn: $settings.keepAudio)
       }
       Section {
+        LabeledContent("Vocabulary") {
+          TextEditor(text: $settings.vocabulary)
+            .font(.body)
+            .frame(height: 54)
+        }
+        Text("Names and terms that keep getting misheard, one per line or comma-separated (e.g. Kubernetes, OKR, Maria Huber). They're given to speech recognition and to the minutes. Applies from the next meeting.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      Section {
         TextField("Your name", text: $settings.myName, prompt: Text("Me"))
         Text("Used as the speaker name for your microphone.")
           .font(.caption).foregroundStyle(.secondary)
@@ -55,6 +66,18 @@ private struct GeneralSettings: View {
           Slider(value: $settings.liveFontSize, in: 11...28, step: 1)
             .frame(width: 180)
           Text("\(Int(settings.liveFontSize)) pt").monospacedDigit().frame(width: 40, alignment: .trailing)
+        }
+      }
+      VoicesSection(settings: settings)
+      Section {
+        Toggle("Subtitles while recording", isOn: $settings.subtitles)
+        Picker("Subtitle position", selection: $settings.subtitlesAtTop) {
+          Text("Bottom of the screen").tag(false)
+          Text("Top of the screen").tag(true)
+        }
+        LabeledContent("Subtitle size") {
+          Slider(value: $settings.subtitleFontSize, in: 18...48, step: 2).frame(width: 180)
+          Text("\(Int(settings.subtitleFontSize)) pt").monospacedDigit().frame(width: 40, alignment: .trailing)
         }
       }
       Section {
@@ -75,6 +98,80 @@ private struct GeneralSettings: View {
   }
 }
 
+/// Remembered voices: people named in earlier meetings get their names automatically.
+private struct VoicesSection: View {
+  @ObservedObject var settings: AppSettings
+  @State private var voices: [VoiceLibrary.Voice] = []
+
+  var body: some View {
+    Section {
+      Toggle("Recognize people I've named before", isOn: $settings.recognizeVoices)
+      if voices.isEmpty {
+        Text("After a meeting, click a speaker's name in the meeting window to rename them and remember their voice.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      ForEach(voices, id: \.name) { voice in
+        LabeledContent(voice.name) {
+          Text(voice.meetings == 1 ? "1 meeting" : "\(voice.meetings) meetings").foregroundStyle(.secondary)
+          Button("Forget") {
+            VoiceLibrary.forget(voice.name)
+            voices = VoiceLibrary.all()
+          }
+        }
+      }
+    } header: {
+      Text("Speakers")
+    }
+    .onAppear { voices = VoiceLibrary.all() }
+  }
+}
+
+private struct MeetingsSettings: View {
+  @ObservedObject var settings: AppSettings
+
+  var body: some View {
+    Form {
+      Section {
+        Picker("Stop after silence", selection: $settings.autoStopMinutes) {
+          ForEach(AppSettings.autoStopChoices, id: \.self) { minutes in
+            Text(minutes == 0 ? "Never" : "\(minutes) min without speech").tag(minutes)
+          }
+        }
+        Text("Stops and saves a recording nobody has spoken in for that long, e.g. one left running after a call.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      Section {
+        Toggle("Offer to record when a call starts", isOn: $settings.detectCalls)
+        Toggle("Also count browser calls (Google Meet, Teams on the web…)", isOn: $settings.detectBrowserCalls)
+          .disabled(!settings.detectCalls)
+        Toggle("Stop and save when the call ends", isOn: $settings.stopWhenCallEnds)
+          .disabled(!settings.detectCalls)
+        Text("Watches which apps use the microphone (Teams, Zoom, Webex, FaceTime, Slack, Discord). It sees app names only, never audio.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      Section {
+        Toggle("Name transcripts after the current calendar event", isOn: $settings.useCalendar)
+        Text("Uses the event's title for the file and gives its attendee list to the minutes. Read on this Mac only.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      Section {
+        Toggle("Global shortcuts", isOn: $settings.globalShortcuts)
+        Text(HotKeys.shared.shortcuts.map { "\($0.display) \(Self.shortcutName($0.id))" }.joined(separator: "   ·   "))
+          .font(.caption).foregroundStyle(.secondary)
+      }
+    }
+    .formStyle(.grouped)
+  }
+
+  private static func shortcutName(_ id: UInt32) -> String {
+    switch id {
+    case 1: "start/stop translating"
+    case 2: "start/stop transcribing"
+    default: "bookmark"
+    }
+  }
+}
+
 private struct TranslationSettings: View {
   @ObservedObject var settings: AppSettings
   @State private var speechLocales: [String] = []
@@ -85,6 +182,7 @@ private struct TranslationSettings: View {
     Form {
       Section("Translate meeting") {
         LocalePicker(title: "People speak", selection: $settings.translateSpokenLocale, options: speechLocales)
+        AlsoPicker(selection: $settings.translateAlsoLocale, options: speechLocales)
         LocalePicker(title: "Translate into", selection: $settings.translateTarget, options: targetLanguages)
         LabeledContent("Translation languages") {
           switch installed {
@@ -133,6 +231,7 @@ private struct TranscriptionSettings: View {
     Form {
       Section("Transcribe meeting") {
         LocalePicker(title: "People speak", selection: $settings.transcribeLocale, options: speechLocales)
+        AlsoPicker(selection: $settings.transcribeAlsoLocale, options: speechLocales)
         Toggle("Include my microphone", isOn: $settings.transcribeIncludeMic)
         Toggle("Identify speakers (Speaker 1, Speaker 2, …)", isOn: $settings.transcribeSeparateSpeakers)
       }
@@ -271,6 +370,22 @@ private struct MicrophoneSettings: View {
     }
     .formStyle(.grouped)
     .onAppear { devices = AudioDevices.inputDevices() }
+  }
+}
+
+/// A second language people switch to; both are recognized and the better one kept per sentence.
+private struct AlsoPicker: View {
+  @Binding var selection: String
+  let options: [String]
+
+  var body: some View {
+    Picker("Sometimes also", selection: $selection) {
+      Text("Nothing else").tag("")
+      ForEach(options.contains(selection) || selection.isEmpty ? options : [selection] + options, id: \.self) { id in
+        Text(AppSettings.localeName(id)).tag(id)
+      }
+    }
+    .help("Recognizes this language in parallel and keeps whichever fits each sentence. Uses more processing power.")
   }
 }
 

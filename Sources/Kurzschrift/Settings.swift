@@ -23,6 +23,40 @@ final class AppSettings: ObservableObject {
   @Published var liveUpdateMilliseconds: Int { didSet { defaults.set(liveUpdateMilliseconds, forKey: "liveUpdateMilliseconds") } }
   static let liveUpdateChoices = [250, 500, 1000, 2000]
   @Published var keepAudio: Bool { didSet { defaults.set(keepAudio, forKey: "keepAudio") } }
+  /// Minutes without any recognized speech before a recording stops and saves by itself (0 = never).
+  @Published var autoStopMinutes: Int { didSet { defaults.set(autoStopMinutes, forKey: "autoStopMinutes") } }
+  static let autoStopChoices = [0, 5, 10, 15, 30, 60]
+  @Published var subtitles: Bool {
+    didSet {
+      defaults.set(subtitles, forKey: "subtitles")
+      SubtitleController.shared.update()
+    }
+  }
+  @Published var subtitlesAtTop: Bool {
+    didSet {
+      defaults.set(subtitlesAtTop, forKey: "subtitlesAtTop")
+      SubtitleController.shared.position()
+    }
+  }
+  @Published var subtitleFontSize: Double { didSet { defaults.set(subtitleFontSize, forKey: "subtitleFontSize") } }
+  @Published var detectCalls: Bool {
+    didSet {
+      defaults.set(detectCalls, forKey: "detectCalls")
+      CallDetector.shared.apply()
+    }
+  }
+  @Published var detectBrowserCalls: Bool { didSet { defaults.set(detectBrowserCalls, forKey: "detectBrowserCalls") } }
+  @Published var stopWhenCallEnds: Bool { didSet { defaults.set(stopWhenCallEnds, forKey: "stopWhenCallEnds") } }
+  @Published var recognizeVoices: Bool { didSet { defaults.set(recognizeVoices, forKey: "recognizeVoices") } }
+  @Published var useCalendar: Bool { didSet { defaults.set(useCalendar, forKey: "useCalendar") } }
+  @Published var globalShortcuts: Bool {
+    didSet {
+      defaults.set(globalShortcuts, forKey: "globalShortcuts")
+      HotKeys.shared.apply(enabled: globalShortcuts)
+    }
+  }
+  /// Names and terms, one per line or comma-separated, given to speech recognition and the minutes.
+  @Published var vocabulary: String { didSet { defaults.set(vocabulary, forKey: "vocabulary") } }
 
   // Translation meetings (use case 1)
   @Published var translateSpokenLocale: String { didSet { defaults.set(translateSpokenLocale, forKey: "translateSpokenLocale") } }
@@ -30,11 +64,14 @@ final class AppSettings: ObservableObject {
   @Published var translateIncludeMic: Bool { didSet { defaults.set(translateIncludeMic, forKey: "translateIncludeMic") } }
   @Published var translateSeparateSpeakers: Bool { didSet { defaults.set(translateSeparateSpeakers, forKey: "translateSeparateSpeakers") } }
   @Published var translateLayout: String { didSet { defaults.set(translateLayout, forKey: "translateLayout") } }
+  /// A second language people may switch to ("" = none), recognized in parallel.
+  @Published var translateAlsoLocale: String { didSet { defaults.set(translateAlsoLocale, forKey: "translateAlsoLocale") } }
 
   // Transcription meetings (use case 2)
   @Published var transcribeLocale: String { didSet { defaults.set(transcribeLocale, forKey: "transcribeLocale") } }
   @Published var transcribeIncludeMic: Bool { didSet { defaults.set(transcribeIncludeMic, forKey: "transcribeIncludeMic") } }
   @Published var transcribeSeparateSpeakers: Bool { didSet { defaults.set(transcribeSeparateSpeakers, forKey: "transcribeSeparateSpeakers") } }
+  @Published var transcribeAlsoLocale: String { didSet { defaults.set(transcribeAlsoLocale, forKey: "transcribeAlsoLocale") } }
 
   // Live minutes (sent to an LLM provider; off by default)
   @Published var minutesForTranslate: Bool { didSet { defaults.set(minutesForTranslate, forKey: "minutesForTranslate") } }
@@ -60,12 +97,25 @@ final class AppSettings: ObservableObject {
       "liveFontSize": 15.0,
       "liveUpdateMilliseconds": 500,
       "keepAudio": false,
+      "vocabulary": "",
+      "autoStopMinutes": 10,
+      "globalShortcuts": true,
+      "useCalendar": true,
+      "recognizeVoices": true,
+      "detectCalls": true,
+      "detectBrowserCalls": false,
+      "stopWhenCallEnds": true,
+      "subtitles": false,
+      "subtitlesAtTop": false,
+      "subtitleFontSize": 28.0,
       "translateSpokenLocale": "de-DE",
       "translateTarget": "en-US",
       "translateIncludeMic": false,
       "translateSeparateSpeakers": true,
       "translateLayout": TranscriptLayout.interleaved.rawValue,
       "transcribeLocale": "en-US",
+      "translateAlsoLocale": "en-US",
+      "transcribeAlsoLocale": "",
       "transcribeIncludeMic": true,
       "transcribeSeparateSpeakers": true,
       "minutesForTranslate": false,
@@ -84,12 +134,25 @@ final class AppSettings: ObservableObject {
     liveFontSize = d.double(forKey: "liveFontSize")
     liveUpdateMilliseconds = d.integer(forKey: "liveUpdateMilliseconds")
     keepAudio = d.bool(forKey: "keepAudio")
+    vocabulary = d.string(forKey: "vocabulary")!
+    autoStopMinutes = d.integer(forKey: "autoStopMinutes")
+    globalShortcuts = d.bool(forKey: "globalShortcuts")
+    useCalendar = d.bool(forKey: "useCalendar")
+    recognizeVoices = d.bool(forKey: "recognizeVoices")
+    detectCalls = d.bool(forKey: "detectCalls")
+    detectBrowserCalls = d.bool(forKey: "detectBrowserCalls")
+    stopWhenCallEnds = d.bool(forKey: "stopWhenCallEnds")
+    subtitles = d.bool(forKey: "subtitles")
+    subtitlesAtTop = d.bool(forKey: "subtitlesAtTop")
+    subtitleFontSize = d.double(forKey: "subtitleFontSize")
     translateSpokenLocale = d.string(forKey: "translateSpokenLocale")!
     translateTarget = d.string(forKey: "translateTarget")!
     translateIncludeMic = d.bool(forKey: "translateIncludeMic")
     translateSeparateSpeakers = d.bool(forKey: "translateSeparateSpeakers")
     translateLayout = d.string(forKey: "translateLayout")!
     transcribeLocale = d.string(forKey: "transcribeLocale")!
+    translateAlsoLocale = d.string(forKey: "translateAlsoLocale")!
+    transcribeAlsoLocale = d.string(forKey: "transcribeAlsoLocale")!
     transcribeIncludeMic = d.bool(forKey: "transcribeIncludeMic")
     transcribeSeparateSpeakers = d.bool(forKey: "transcribeSeparateSpeakers")
     minutesForTranslate = d.bool(forKey: "minutesForTranslate")
@@ -130,9 +193,14 @@ final class AppSettings: ObservableObject {
   func minutesConfig(for mode: MeetingMode) -> MinutesConfig? {
     guard minutesEnabled(for: mode), let key = APIKeyStore.key(for: provider), !minutesModel.isEmpty else { return nil }
     let language = mode == .translate ? Self.languageName(translateTarget) : Self.languageName(transcribeLocale)
+    var instructions = minutesInstructions
+    if !vocabularyTerms.isEmpty {
+      instructions += "\nNames and terms that may come up (the transcript may misspell them): "
+        + vocabularyTerms.joined(separator: ", ")
+    }
     return MinutesConfig(
       provider: provider, model: minutesModel, apiKey: key, interval: TimeInterval(max(1, minutesIntervalMinutes) * 60),
-      language: language, instructions: minutesInstructions)
+      language: language, instructions: instructions)
   }
 
   func minutesProblem(for mode: MeetingMode) -> String? {
@@ -142,8 +210,22 @@ final class AppSettings: ObservableObject {
     return nil
   }
 
+  var vocabularyTerms: [String] {
+    vocabulary.components(separatedBy: CharacterSet(charactersIn: ",\n"))
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+  }
+
   /// Frozen copy of the settings a session runs with, so edits mid-meeting don't half-apply.
   func snapshot(for mode: MeetingMode) -> SessionConfig {
+    var config = baseSnapshot(for: mode)
+    config.vocabulary = vocabularyTerms
+    let also = mode == .translate ? translateAlsoLocale : transcribeAlsoLocale
+    config.secondLocale = also.isEmpty ? nil : Locale(identifier: also)
+    return config
+  }
+
+  private func baseSnapshot(for mode: MeetingMode) -> SessionConfig {
     switch mode {
     case .translate:
       SessionConfig(
@@ -197,7 +279,7 @@ enum TranscriptLayout: String, CaseIterable, Identifiable {
 
 struct SessionConfig {
   let mode: MeetingMode
-  let spokenLocale: Locale
+  var spokenLocale: Locale
   let targetLanguage: Locale.Language?
   var includeMic: Bool
   let separateSpeakers: Bool
@@ -208,4 +290,10 @@ struct SessionConfig {
   var keepAudio: Bool
   let layout: TranscriptLayout
   var minutes: MinutesConfig?
+  var vocabulary: [String] = []
+  /// A second spoken language recognized in parallel (mixed-language meetings).
+  var secondLocale: Locale?
+  /// From the calendar event happening when the meeting started.
+  var eventTitle: String?
+  var attendees: [String] = []
 }

@@ -46,6 +46,29 @@ final class SessionController: ObservableObject {
     let start: Double
     let original: String
     var translation: String?
+    var isBookmark = false
+  }
+
+  struct QAItem: Identifiable {
+    let id = UUID()
+    let question: String
+    var answer: String?
+    var error: String?
+  }
+
+  /// The last meeting after it stopped, kept so its file can be rewritten (questions asked
+  /// afterwards, renamed speakers).
+  struct FinishedMeeting {
+    let document: TranscriptDocument
+    var turns: [Turn]
+    let endedAt: Date
+    let notes: [String]
+    let audioFiles: [URL]
+    var minutes: String?
+    let bookmarks: [Double]
+    let config: SessionConfig
+    /// Speaker name → voice embedding, for "remember this voice" when renaming.
+    var voices: [String: [Float]]
   }
 
   /// What is being said right now: the recognizer's in-progress text and, when translating, its
@@ -55,7 +78,9 @@ final class SessionController: ObservableObject {
     var translation: String?
   }
 
-  @Published private(set) var phase: Phase = .idle
+  @Published private(set) var phase: Phase = .idle {
+    didSet { SubtitleController.shared.update() }
+  }
   @Published private(set) var config: SessionConfig?
   @Published private(set) var startedAt: Date?
   @Published private(set) var elapsedSeconds = 0
@@ -65,6 +90,10 @@ final class SessionController: ObservableObject {
   @Published private(set) var minutes: MinutesState?
   @Published private(set) var warning: String?
   @Published private(set) var lastTranscript: URL?
+  /// Seconds until the recording stops by itself for lack of speech; set only in the last minute.
+  @Published private(set) var autoStopIn: Int?
+  @Published private(set) var questions: [QAItem] = []
+  @Published private(set) var finished: FinishedMeeting?
 
   var isIdle: Bool { phase == .idle }
   var isRecording: Bool { phase == .recording }
@@ -74,6 +103,9 @@ final class SessionController: ObservableObject {
   private var micSource: MicrophoneSource?
   private var fileSource: FileAudioSource?
   private var pipelines: [AudioSourceKind: SpeechPipeline] = [:]
+  /// Mixed-language meetings: a second recognizer per source and the arbiter that picks per window.
+  private var secondaryPipelines: [AudioSourceKind: SpeechPipeline] = [:]
+  private var arbiters: [AudioSourceKind: LanguageArbiter] = [:]
   private var translator: Translator?
   private var segments: [FinalSegment] = []
   private var document: TranscriptDocument?
@@ -82,6 +114,9 @@ final class SessionController: ObservableObject {
   private var pendingPreview: [AudioSourceKind: String] = [:]
   private var previewGeneration: [AudioSourceKind: Int] = [:]
   private var minutesRunner: MinutesRunner?
+  private var lastSpeechAt = Date()
+  /// Session times (seconds) the user marked with ⌃⌥B or the ⭐ button.
+  private var bookmarks: [Double] = []
 
   // MARK: Start
 
@@ -94,10 +129,24 @@ final class SessionController: ObservableObject {
     Log.write("start(\(mode))")
     var config = AppSettings.shared.snapshot(for: mode)
     if testAudio != nil { config.includeMic = false }
+    if AppSettings.shared.useCalendar, testAudio == nil {
+      phase = .starting("Checking the calendar…")
+      if let meeting = await CalendarContext.currentMeeting() {
+        config.eventTitle = meeting.title
+        config.attendees = meeting.attendees
+        if !meeting.attendees.isEmpty, let minutes = config.minutes {
+          config.minutes = minutes.adding(
+            instructions: "Attendees from the calendar invite: " + meeting.attendees.joined(separator: ", "))
+        }
+      }
+    }
     self.config = config
     entries = []
     livePartials = [:]
     segments = []
+    bookmarks = []
+    questions = []
+    finished = nil
     warning = AppSettings.shared.minutesProblem(for: mode)
     minutes = nil
     phase = .starting("Preparing speech recognition…")
@@ -121,12 +170,24 @@ final class SessionController: ObservableObject {
         throw SessionError.microphoneDenied
       }
 
+      var secondLocale: Locale?
+      if let wanted = config.secondLocale, !LanguageArbiter.sameLanguage(wanted.identifier, locale.identifier) {
+        phase = .starting("Preparing \(AppSettings.languageName(wanted.identifier)) recognition…")
+        secondLocale = try? await SpeechPipeline.prepareModel(for: wanted)
+      }
+
       phase = .starting("Starting audio…")
       let sources: [AudioSourceKind] = config.includeMic ? [.system, .microphone] : [.system]
       for source in sources {
-        let pipeline = try await SpeechPipeline.make(source: source, locale: locale)
+        let pipeline = try await SpeechPipeline.make(source: source, locale: locale, vocabulary: config.vocabulary)
         pipeline.start { [weak self] event in await self?.handle(event) }
         pipelines[source] = pipeline
+        if let secondLocale {
+          let second = try await SpeechPipeline.make(source: source, locale: secondLocale, vocabulary: config.vocabulary)
+          second.start { [weak self] event in await self?.handle(event) }
+          secondaryPipelines[source] = second
+          arbiters[source] = LanguageArbiter(primary: locale.identifier, secondary: secondLocale.identifier)
+        }
       }
       if config.separateSpeakers { Diarization.prepareModelsInBackground() }
 
@@ -135,9 +196,13 @@ final class SessionController: ObservableObject {
       let start = Date()
       for source in sources {
         let pipeline = pipelines[source]!
+        let second = secondaryPipelines[source]
         tracks[source] = try Track(
           kind: source, fileURL: folder.appendingPathComponent("\(source.rawValue).wav"), sessionStart: start
-        ) { buffer in pipeline.append(buffer) }
+        ) { buffer in
+          pipeline.append(buffer)
+          second?.append(buffer)
+        }
       }
       if let testAudio {
         let file = FileAudioSource(track: tracks[.system]!, url: testAudio)
@@ -157,6 +222,8 @@ final class SessionController: ObservableObject {
       document = try TranscriptDocument(config: config, startedAt: start)
       document?.writeDraft(entries: [])
       startedAt = start
+      lastSpeechAt = start
+      autoStopIn = nil
       elapsedSeconds = 0
       phase = .recording
       startPreviewLoop()
@@ -184,6 +251,7 @@ final class SessionController: ObservableObject {
     }
     Log.write("stop: \(segments.count) segments so far")
     phase = .finishing("Finishing transcription…")
+    autoStopIn = nil
     previewTask?.cancel()
     systemSource?.stop()
     micSource?.stop()
@@ -192,8 +260,13 @@ final class SessionController: ObservableObject {
     micSource = nil
     fileSource = nil
     for track in tracks.values { track.close() }
-    for pipeline in pipelines.values { await pipeline.finish() }
+    for pipeline in Array(pipelines.values) + Array(secondaryPipelines.values) { await pipeline.finish() }
+    for arbiter in arbiters.values {
+      for segment in arbiter.flushAll() { await commit(segment) }
+    }
     pipelines = [:]
+    secondaryPipelines = [:]
+    arbiters = [:]
     livePartials = [:]
     minutesRunner?.stop()
     let endedAt = Date()
@@ -201,6 +274,7 @@ final class SessionController: ObservableObject {
 
     var notes: [String] = []
     var speakers: [AudioSourceKind: [SpeakerSpan]] = [:]
+    var speakerVoices: [String: [Float]] = [:]
     if config.separateSpeakers {
       var toDiarize: [AudioSourceKind] = segments.contains { $0.source == .system } ? [.system] : []
       if config.micShared, segments.contains(where: { $0.source == .microphone }) { toDiarize.append(.microphone) }
@@ -208,7 +282,9 @@ final class SessionController: ObservableObject {
         guard let track = tracks[source] else { continue }
         phase = .finishing("Identifying speakers…")
         do {
-          speakers[source] = try await Diarization.speakers(in: track.fileURL)
+          let result = try await Diarization.speakers(in: track.fileURL)
+          speakers[source] = result.spans
+          for (id, embedding) in result.voices { speakerVoices["\(source.rawValue):\(id)"] = embedding }
           Log.write("diarized \(source): \(speakers[source]?.count ?? 0) spans, \(Set(speakers[source]?.map(\.speaker) ?? []).count) speakers")
         } catch {
           Log.write("diarization failed: \(error)")
@@ -217,13 +293,23 @@ final class SessionController: ObservableObject {
       }
     }
 
-    var turns = TranscriptBuilder.turns(segments: segments, speakers: speakers, config: config)
+    let known = AppSettings.shared.recognizeVoices ? VoiceLibrary.match(speakerVoices) : [:]
+    if !known.isEmpty { Log.write("recognized \(known.count) known voice(s)") }
+    let built = TranscriptBuilder.build(segments: segments, speakers: speakers, config: config, knownNames: known)
+    var turns = built.turns
+    var voicesByName: [String: [Float]] = [:]
+    for (label, name) in built.speakerNames { if let voice = speakerVoices[label] { voicesByName[name] = voice } }
     if let translator {
       phase = .finishing("Translating transcript…")
       for i in turns.indices {
         var parts: [String] = []
-        for piece in turns[i].pieces {
-          parts.append(await translator.translate(piece) ?? "")
+        for (index, piece) in turns[i].pieces.enumerated() {
+          let language = index < turns[i].languages.count ? turns[i].languages[index] : ""
+          if let target = config.targetLanguage, LanguageArbiter.sameLanguage(language, target.minimalIdentifier) {
+            parts.append(piece)
+          } else {
+            parts.append(await translator.translate(piece) ?? "")
+          }
         }
         turns[i].translation = parts.joined(separator: " ")
       }
@@ -232,8 +318,9 @@ final class SessionController: ObservableObject {
     var finalMinutes: String?
     if let minutesRunner {
       phase = .finishing("Writing minutes…")
-      let transcript = turns.map { "[\(TranscriptDocument.clock($0.start))] \($0.speaker ?? "Speaker"): \($0.text)" }
-        .joined(separator: "\n")
+      let lines = turns.map { (start: $0.start, line: "[\(TranscriptDocument.clock($0.start))] \($0.speaker ?? "Speaker"): \($0.text)") }
+        + bookmarks.map { (start: $0, line: Self.bookmarkLine($0)) }
+      let transcript = lines.sorted { $0.start < $1.start }.map(\.line).joined(separator: "\n")
       finalMinutes = await minutesRunner.finalize(transcript: transcript)
       if finalMinutes == nil, let live = minutes?.text, !live.isEmpty {
         finalMinutes = live
@@ -249,12 +336,16 @@ final class SessionController: ObservableObject {
         if (try? FileManager.default.moveItem(at: track.fileURL, to: target)) != nil { audioFiles.append(target) }
       }
     }
-    document.writeFinal(turns: turns, endedAt: endedAt, notes: notes, audioFiles: audioFiles, minutes: finalMinutes)
+    finished = FinishedMeeting(
+      document: document, turns: turns, endedAt: endedAt, notes: notes, audioFiles: audioFiles, minutes: finalMinutes,
+      bookmarks: bookmarks, config: config, voices: voicesByName)
+    rewriteFinished()
     Log.write("saved \(document.url.lastPathComponent): \(turns.count) turns")
     lastTranscript = document.url
     entries = turns.map {
       LiveEntry(id: UUID(), source: .system, speaker: $0.speaker, start: $0.start, original: $0.text, translation: $0.translation)
-    }
+    } + bookmarks.map(Self.bookmarkEntry)
+    entries.sort { $0.start < $1.start }
 
     await tearDown()
     phase = .idle
@@ -269,10 +360,12 @@ final class SessionController: ObservableObject {
     fileSource?.stop()
     fileSource = nil
     for track in tracks.values { track.close() }
-    for pipeline in pipelines.values { await pipeline.finish() }
+    for pipeline in Array(pipelines.values) + Array(secondaryPipelines.values) { await pipeline.finish() }
     systemSource = nil
     micSource = nil
     pipelines = [:]
+    secondaryPipelines = [:]
+    arbiters = [:]
     tracks = [:]
     translator = nil
     document = nil
@@ -284,29 +377,53 @@ final class SessionController: ObservableObject {
   // MARK: Live results
 
   private func handle(_ event: SpeechEvent) async {
+    lastSpeechAt = Date()
+    autoStopIn = nil
     switch event {
-    case .partial(let source, let raw):
+    case .partial(let source, let raw, let language):
+      // In mixed meetings, show in-progress text only from the language currently being spoken.
+      if let arbiter = arbiters[source], !LanguageArbiter.sameLanguage(language, arbiter.current) { return }
       let text = TextCleanup.tidy(TextCleanup.splitLeadingPunctuation(raw).rest)
       livePartials[source, default: LivePartial()].original = text
-      if translator != nil { pendingPreview[source] = text }
-
-    case .final(var segment):
-      previewGeneration[segment.source, default: 0] += 1
-      pendingPreview[segment.source] = nil
-      livePartials[segment.source] = nil
-      repairPunctuation(&segment)
-      guard !segment.text.isEmpty else { return }
-      Log.write("final \(segment.source) \(String(format: "%.1f-%.1f", segment.start, segment.end)): \(segment.text.count) chars")
-      segments.append(segment)
-      let speaker = config?.includeMic == true ? (segment.source == .microphone ? config?.myName : "Others") : nil
-      var entry = LiveEntry(
-        id: segment.id, source: segment.source, speaker: speaker, start: segment.start, original: segment.text)
-      if let translator { entry.translation = await translator.translate(segment.text) }
-      if insert(entry, for: segment) {
-        minutesRunner?.add(line: "[\(TranscriptDocument.clock(segment.start))] \(speaker ?? "Speaker"): \(segment.text)")
+      if let target = config?.targetLanguage, LanguageArbiter.sameLanguage(language, target.minimalIdentifier) {
+        livePartials[source]?.translation = text  // already in the translation language
+      } else if translator != nil {
+        pendingPreview[source] = text
       }
-      document?.writeDraft(entries: entries, minutes: minutes?.text)
+
+    case .final(let segment):
+      if let arbiter = arbiters[segment.source] {
+        for chosen in arbiter.add(segment) { await commit(chosen) }
+      } else {
+        await commit(segment)
+      }
     }
+  }
+
+  /// A finished stretch of speech: into the transcript, the translation, the file and the minutes.
+  private func commit(_ incoming: FinalSegment) async {
+    var segment = incoming
+    previewGeneration[segment.source, default: 0] += 1
+    pendingPreview[segment.source] = nil
+    livePartials[segment.source] = nil
+    repairPunctuation(&segment)
+    guard !segment.text.isEmpty else { return }
+    Log.write("final \(segment.source) \(String(format: "%.1f-%.1f", segment.start, segment.end)): \(segment.text.count) chars")
+    segments.append(segment)
+    let speaker = config?.includeMic == true ? (segment.source == .microphone ? config?.myName : "Others") : nil
+    var entry = LiveEntry(
+      id: segment.id, source: segment.source, speaker: speaker, start: segment.start, original: segment.text)
+    if let translator {
+      if let target = config?.targetLanguage, LanguageArbiter.sameLanguage(segment.locale, target.minimalIdentifier) {
+        entry.translation = segment.text  // spoken in the translation language already
+      } else {
+        entry.translation = await translator.translate(segment.text)
+      }
+    }
+    if insert(entry, for: segment) {
+      minutesRunner?.add(line: "[\(TranscriptDocument.clock(segment.start))] \(speaker ?? "Speaker"): \(segment.text)")
+    }
+    document?.writeDraft(entries: entries, minutes: minutes?.text)
   }
 
   /// Returns false when the line was dropped as loudspeaker echo.
@@ -325,6 +442,130 @@ final class SessionController: ObservableObject {
     let index = entries.lastIndex { $0.start <= entry.start }.map { $0 + 1 } ?? 0
     entries.insert(entry, at: index)
     return true
+  }
+
+  /// Stops and saves after Settings → "Stop after silence" minutes without speech, counting down
+  /// the last minute in the window.
+  private func checkAutoStop() {
+    let limit = Double(AppSettings.shared.autoStopMinutes * 60)
+    guard limit > 0, isRecording else { return }
+    let quiet = Date().timeIntervalSince(lastSpeechAt)
+    if quiet >= limit {
+      Log.write("auto-stop after \(Int(quiet)) s without speech")
+      autoStopIn = nil
+      Task { @MainActor in await self.stop() }
+    } else if quiet >= limit - 60 {
+      autoStopIn = Int(limit - quiet)
+    } else if autoStopIn != nil {
+      autoStopIn = nil
+    }
+  }
+
+  /// Writes the finished meeting's file again with its current speaker names and questions.
+  func rewriteFinished() {
+    guard let f = finished else { return }
+    let qa = questions.compactMap { item in item.answer.map { (question: item.question, answer: $0) } }
+    f.document.writeFinal(
+      turns: f.turns, endedAt: f.endedAt, notes: f.notes, audioFiles: f.audioFiles, minutes: f.minutes,
+      bookmarks: f.bookmarks, qa: qa)
+  }
+
+  /// Renames a speaker throughout the finished meeting (file, window, minutes) and, if asked,
+  /// remembers the voice so the name is used automatically next time.
+  func renameSpeaker(_ old: String, to newName: String, remember: Bool) {
+    let new = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard var f = finished, !new.isEmpty, new != old else { return }
+    for i in f.turns.indices where f.turns[i].speaker == old { f.turns[i].speaker = new }
+    let pattern = "\\b" + NSRegularExpression.escapedPattern(for: old) + "\\b"
+    let template = NSRegularExpression.escapedTemplate(for: new)
+    f.minutes = f.minutes?.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
+    if let voice = f.voices.removeValue(forKey: old) {
+      f.voices[new] = voice
+      if remember { VoiceLibrary.remember(new, embedding: voice) }
+    }
+    finished = f
+    entries = entries.map { entry in
+      guard entry.speaker == old else { return entry }
+      return LiveEntry(
+        id: entry.id, source: entry.source, speaker: new, start: entry.start, original: entry.original,
+        translation: entry.translation, isBookmark: entry.isBookmark)
+    }
+    if var state = minutes, let text = f.minutes {
+      state.text = text
+      minutes = state
+    }
+    rewriteFinished()
+    Log.write("speaker renamed")
+  }
+
+  // MARK: Questions
+
+  var canAsk: Bool {
+    let settings = AppSettings.shared
+    return !settings.minutesModel.isEmpty && APIKeyStore.key(for: settings.provider) != nil
+  }
+
+  func ask(_ question: String) {
+    let question = question.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !question.isEmpty else { return }
+    let settings = AppSettings.shared
+    let index = questions.count
+    questions.append(QAItem(question: question))
+    guard let key = APIKeyStore.key(for: settings.provider), !settings.minutesModel.isEmpty else {
+      questions[index].error = MinutesError.noKey.localizedDescription
+      return
+    }
+    let transcript = entries.map { entry in
+      entry.isBookmark
+        ? "[\(TranscriptDocument.clock(entry.start))] ⭐ bookmarked by the user"
+        : "[\(TranscriptDocument.clock(entry.start))] \(entry.speaker ?? "Speaker"): \(entry.original)"
+    }.joined(separator: "\n")
+    let language = config.map { config in
+      AppSettings.languageName(config.targetLanguage?.minimalIdentifier ?? config.spokenLocale.identifier)
+    } ?? "English"
+    let client = MinutesClient(provider: settings.provider, model: settings.minutesModel, apiKey: key)
+    Task {
+      do {
+        let result = try await client.answer(question: question, transcript: transcript, language: language)
+        questions[index].answer = result.text
+        Log.write("question answered, usage in=\(result.usage.input) out=\(result.usage.output)")
+        if isIdle { rewriteFinished() }
+      } catch {
+        questions[index].error = error.localizedDescription
+      }
+    }
+  }
+
+  /// Start/stop from the global shortcuts: stops whatever is recording, otherwise starts `mode`.
+  func toggle(_ mode: MeetingMode) {
+    Task {
+      if isRecording { await stop() } else if isIdle { await start(mode) }
+    }
+  }
+
+  func addBookmark() {
+    guard isRecording, let startedAt else { return }
+    let time = Date().timeIntervalSince(startedAt)
+    bookmarks.append(time)
+    let index = entries.lastIndex { $0.start <= time }.map { $0 + 1 } ?? 0
+    entries.insert(Self.bookmarkEntry(time), at: index)
+    minutesRunner?.add(line: Self.bookmarkLine(time))
+    document?.writeDraft(entries: entries, minutes: minutes?.text)
+    NSSound(named: "Pop")?.play()
+    Log.write("bookmark at \(Int(time)) s")
+  }
+
+  private static func bookmarkEntry(_ time: Double) -> LiveEntry {
+    LiveEntry(id: UUID(), source: .system, speaker: nil, start: time, original: "Bookmark", isBookmark: true)
+  }
+
+  private static func bookmarkLine(_ time: Double) -> String {
+    "[\(TranscriptDocument.clock(time))] ⭐ The user bookmarked this moment as important."
+  }
+
+  func keepRecording() {
+    lastSpeechAt = Date()
+    autoStopIn = nil
   }
 
   /// Moves punctuation that the recognizer put at the start of this segment back to the end of the
@@ -365,6 +606,10 @@ final class SessionController: ObservableObject {
       var lines: [String] = []
       if let minutes = minutes?.text, !minutes.isEmpty { lines += ["MINUTES", "", minutes, "", "TRANSCRIPT", ""] }
       for entry in entries {
+        if entry.isBookmark {
+          lines += ["[\(TranscriptDocument.clock(entry.start))] * BOOKMARK *", ""]
+          continue
+        }
         lines.append("[\(TranscriptDocument.clock(entry.start))]\(entry.speaker.map { " \($0)" } ?? "")")
         lines.append(entry.original)
         if let translation = entry.translation { lines.append(translation) }
@@ -419,6 +664,16 @@ final class SessionController: ObservableObject {
         guard let self, self.phase == .recording, let startedAt = self.startedAt else { continue }
         let elapsed = Int(Date().timeIntervalSince(startedAt))
         if elapsed != self.elapsedSeconds { self.elapsedSeconds = elapsed }
+        self.checkAutoStop()
+        // Decide mixed-language windows once both recognizers have finalized past them.
+        let now = Date().timeIntervalSince(startedAt)
+        for (source, arbiter) in self.arbiters {
+          var progress: [String: Double] = [:]
+          for pipeline in [self.pipelines[source], self.secondaryPipelines[source]].compactMap({ $0 }) {
+            progress[pipeline.locale.identifier] = await pipeline.finalizedThrough() ?? now
+          }
+          for segment in arbiter.flush(progress: progress, horizon: now - 30) { await self.commit(segment) }
+        }
         if !warnedAboutSilence, elapsed >= 20, self.tracks[.system]?.hasSignal == false {
           warnedAboutSilence = true
           self.warning = "No meeting audio received yet. If people are talking, allow Kurzschrift under "
