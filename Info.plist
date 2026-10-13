@@ -42,6 +42,10 @@
   <string>Kurzschrift transcribes what you say in meetings.</string>
   <key>NSAudioCaptureUsageDescription</key>
   <string>Kurzschrift transcribes and translates what other people say in your meetings.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>Kurzschrift names transcripts after the calendar event you're in and gives its attendee list to the minutes.</string>
+  <key>NSRemindersFullAccessUsageDescription</key>
+  <string>Kurzschrift adds the action items from your meeting minutes to Reminders when you ask it to.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>Kurzschrift uses on-device speech recognition to transcribe meetings.</string>
 </dict>
