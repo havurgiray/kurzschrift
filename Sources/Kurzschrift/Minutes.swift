@@ -1,0 +1,504 @@
+import Foundation
+
+// Live meeting minutes written by an LLM (Anthropic or OpenAI) from the growing transcript.
+// This is the only part of Kurzschrift that sends anything off the Mac, and only when switched on.
+
+enum MinutesProvider: String, CaseIterable, Identifiable {
+  case anthropic
+  case openai
+
+  var id: String { rawValue }
+
+  var displayName: String {
+    switch self {
+    case .anthropic: "Anthropic (Claude)"
+    case .openai: "OpenAI"
+    }
+  }
+
+  var defaultModel: String {
+    switch self {
+    case .anthropic: "claude-opus-5-5"
+    case .openai: ""  // picked from the account's model list ("Test key")
+    }
+  }
+
+  var keysPage: URL {
+    switch self {
+    case .anthropic: URL(string: "https://console.anthropic.com/settings/keys")!
+    case .openai: URL(string: "https://platform.openai.com/api-keys")!
+    }
+  }
+
+  /// Hidden override (`defaults write local.kurzschrift minutesBaseURL.<provider> …`) for testing
+  /// against a local mock server.
+  var baseURL: URL {
+    if let override = UserDefaults.standard.string(forKey: "minutesBaseURL.\(rawValue)"),
+      let url = URL(string: override)
+    {
+      return url
+    }
+    switch self {
+    case .anthropic: return URL(string: "https://api.anthropic.com")!
+    case .openai: return URL(string: "https://api.openai.com")!
+    }
+  }
+}
+
+/// API keys are kept in a file only this user can read, not in the keychain: the app is signed ad
+/// hoc, so after every rebuild the keychain would ask for the login password to read the key again.
+enum APIKeyStore {
+  static let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("Kurzschrift/api-keys.json")
+
+  static func key(for provider: MinutesProvider) -> String? {
+    guard let data = try? Data(contentsOf: url),
+      let keys = try? JSONDecoder().decode([String: String].self, from: data),
+      let key = keys[provider.rawValue]?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty
+    else { return nil }
+    return key
+  }
+
+  static func setKey(_ key: String, for provider: MinutesProvider) {
+    var keys = (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: url))) ?? [:]
+    let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+    keys[provider.rawValue] = trimmed.isEmpty ? nil : trimmed
+    do {
+      try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try JSONEncoder().encode(keys).write(to: url, options: .atomic)
+      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    } catch {
+      Log.write("saving API key failed: \(error)")
+    }
+  }
+}
+
+struct MinutesConfig {
+  let provider: MinutesProvider
+  let model: String
+  let apiKey: String
+  let interval: TimeInterval
+  /// Language the minutes are written in, e.g. "English".
+  let language: String
+  let instructions: String
+}
+
+struct MinutesUsage: Equatable {
+  var input = 0
+  var cacheRead = 0
+  var cacheWrite = 0
+  var output = 0
+
+  static func + (a: MinutesUsage, b: MinutesUsage) -> MinutesUsage {
+    MinutesUsage(
+      input: a.input + b.input, cacheRead: a.cacheRead + b.cacheRead, cacheWrite: a.cacheWrite + b.cacheWrite,
+      output: a.output + b.output)
+  }
+
+  /// Rough cost in USD for the Claude models whose list prices are known here; nil otherwise.
+  func estimatedCost(model: String, longCache: Bool) -> Double? {
+    let prices: [String: (input: Double, output: Double, cacheRead: Double)] = [
+      "claude-opus-5-5": (4, 20, 0.20),
+      "claude-sonnet-5-5": (2, 10, 0.20),
+      "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    ]
+    guard let p = prices[model] else { return nil }
+    let writeFactor = longCache ? 2.0 : 1.25
+    let dollars =
+      Double(input) * p.input + Double(cacheWrite) * p.input * writeFactor + Double(cacheRead) * p.cacheRead
+      + Double(output) * p.output
+    return dollars / 1_000_000
+  }
+}
+
+enum MinutesError: LocalizedError {
+  case noKey
+  case http(Int, String)
+  case refused(String?)
+  case emptyResponse
+  case network(String)
+
+  var errorDescription: String? {
+    switch self {
+    case .noKey: "No API key is set (Settings → Minutes)."
+    case .http(401, _): "The API key was rejected. Check it in Settings → Minutes."
+    case .http(404, let message): "Model not available to this key: \(message)"
+    case .http(429, _): "Rate limited by the provider. Will retry at the next update."
+    case .http(529, _), .http(503, _): "The provider is overloaded. Will retry at the next update."
+    case .http(let status, let message): "HTTP \(status): \(message)"
+    case .refused(let category): "The model declined to write minutes\(category.map { " (\($0))" } ?? "")."
+    case .emptyResponse: "The model returned no text."
+    case .network(let message): "Network error: \(message)"
+    }
+  }
+
+  var isRetryable: Bool {
+    switch self {
+    case .http(let status, _): [408, 429, 500, 502, 503, 504, 529].contains(status)
+    case .network: true
+    default: false
+    }
+  }
+}
+
+/// Talks to the Anthropic Messages API or OpenAI Chat Completions over plain HTTPS.
+final class MinutesClient: @unchecked Sendable {
+  let provider: MinutesProvider
+  let model: String
+  private let apiKey: String
+  private var fallbacksRejected = false
+
+  init(provider: MinutesProvider, model: String, apiKey: String) {
+    self.provider = provider
+    self.model = model
+    self.apiKey = apiKey
+  }
+
+  /// `transcriptChunks` only ever grows at the end, so the provider can cache everything but the
+  /// newest chunk; the previous minutes and the request come after the cached part.
+  func minutes(
+    transcriptChunks: [String], previousMinutes: String?, config: MinutesConfig, final: Bool, longCache: Bool
+  ) async throws -> (text: String, usage: MinutesUsage) {
+    let system = Self.systemPrompt(language: config.language, instructions: config.instructions, final: final)
+    let tail = Self.requestText(previousMinutes: previousMinutes, final: final)
+    do {
+      return try await send(system: system, chunks: transcriptChunks, tail: tail, final: final, longCache: longCache)
+    } catch let error as MinutesError where error.isRetryable {
+      try await Task.sleep(for: .seconds(3))
+      return try await send(system: system, chunks: transcriptChunks, tail: tail, final: final, longCache: longCache)
+    }
+  }
+
+  /// Validates the key and returns the models it can use.
+  func listModels() async throws -> [String] {
+    var request = URLRequest(url: provider.baseURL.appendingPathComponent("v1/models"))
+    request.timeoutInterval = 20
+    switch provider {
+    case .anthropic:
+      request.url = URL(string: request.url!.absoluteString + "?limit=100")
+      request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+      request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+    case .openai:
+      request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    }
+    let json = try await perform(request)
+    let ids = ((json["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
+    switch provider {
+    case .anthropic:
+      return ids
+    case .openai:
+      let excluded = ["audio", "realtime", "tts", "transcribe", "image", "embedding", "search", "moderation", "whisper", "dall-e"]
+      return ids.filter { id in
+        (id.hasPrefix("gpt-") || id.hasPrefix("o")) && !excluded.contains { id.contains($0) }
+      }.sorted()
+    }
+  }
+
+  // MARK: Requests
+
+  private func send(system: String, chunks: [String], tail: String, final: Bool, longCache: Bool) async throws
+    -> (text: String, usage: MinutesUsage)
+  {
+    switch provider {
+    case .anthropic: try await sendAnthropic(system: system, chunks: chunks, tail: tail, final: final, longCache: longCache)
+    case .openai: try await sendOpenAI(system: system, chunks: chunks, tail: tail)
+    }
+  }
+
+  private func sendAnthropic(system: String, chunks: [String], tail: String, final: Bool, longCache: Bool)
+    async throws -> (text: String, usage: MinutesUsage)
+  {
+    var content: [[String: Any]] = [["type": "text", "text": Self.transcriptIntro]]
+    for (i, chunk) in chunks.enumerated() {
+      var block: [String: Any] = ["type": "text", "text": chunk]
+      if i == chunks.count - 1 {
+        block["cache_control"] = longCache ? ["type": "ephemeral", "ttl": "1h"] : ["type": "ephemeral"]
+      }
+      content.append(block)
+    }
+    content.append(["type": "text", "text": tail])
+
+    var body: [String: Any] = [
+      "model": model,
+      "max_tokens": 16000,
+      "system": system,
+      "messages": [["role": "user", "content": content]],
+    ]
+    if Self.supportsEffort(model) {
+      body["output_config"] = ["effort": final ? "medium" : "low"]
+    }
+    let useFallbacks = Self.supportsFallbacks(model) && !fallbacksRejected
+    if useFallbacks { body["fallbacks"] = "default" }
+
+    var request = URLRequest(url: provider.baseURL.appendingPathComponent("v1/messages"))
+    request.httpMethod = "POST"
+    request.timeoutInterval = 300
+    request.setValue("application/json", forHTTPHeaderField: "content-type")
+    request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+    request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+    if useFallbacks { request.setValue("server-side-fallback-2026-07-01", forHTTPHeaderField: "anthropic-beta") }
+    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+    let json: [String: Any]
+    do {
+      json = try await perform(request)
+    } catch MinutesError.http(400, let message) where useFallbacks && message.contains("fallback") {
+      // The account doesn't have the fallback beta: carry on without it.
+      fallbacksRejected = true
+      return try await sendAnthropic(system: system, chunks: chunks, tail: tail, final: final, longCache: longCache)
+    }
+
+    if json["stop_reason"] as? String == "refusal" {
+      throw MinutesError.refused((json["stop_details"] as? [String: Any])?["category"] as? String)
+    }
+    let text = ((json["content"] as? [[String: Any]]) ?? [])
+      .filter { $0["type"] as? String == "text" }
+      .compactMap { $0["text"] as? String }
+      .joined()
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { throw MinutesError.emptyResponse }
+    let u = json["usage"] as? [String: Any] ?? [:]
+    let usage = MinutesUsage(
+      input: u["input_tokens"] as? Int ?? 0, cacheRead: u["cache_read_input_tokens"] as? Int ?? 0,
+      cacheWrite: u["cache_creation_input_tokens"] as? Int ?? 0, output: u["output_tokens"] as? Int ?? 0)
+    return (text, usage)
+  }
+
+  private func sendOpenAI(system: String, chunks: [String], tail: String) async throws
+    -> (text: String, usage: MinutesUsage)
+  {
+    // OpenAI caches long prompt prefixes automatically; keeping the transcript first preserves that.
+    let user = ([Self.transcriptIntro] + chunks + [tail]).joined(separator: "\n\n")
+    let body: [String: Any] = [
+      "model": model,
+      "messages": [["role": "system", "content": system], ["role": "user", "content": user]],
+    ]
+    var request = URLRequest(url: provider.baseURL.appendingPathComponent("v1/chat/completions"))
+    request.httpMethod = "POST"
+    request.timeoutInterval = 300
+    request.setValue("application/json", forHTTPHeaderField: "content-type")
+    request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+    let json = try await perform(request)
+    let message = ((json["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any]) ?? [:]
+    if let refusal = message["refusal"] as? String, !refusal.isEmpty { throw MinutesError.refused(nil) }
+    let text = (message["content"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { throw MinutesError.emptyResponse }
+    let u = json["usage"] as? [String: Any] ?? [:]
+    let cached = (u["prompt_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int ?? 0
+    let usage = MinutesUsage(
+      input: (u["prompt_tokens"] as? Int ?? 0) - cached, cacheRead: cached, cacheWrite: 0,
+      output: u["completion_tokens"] as? Int ?? 0)
+    return (text, usage)
+  }
+
+  private func perform(_ request: URLRequest) async throws -> [String: Any] {
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await URLSession.shared.data(for: request)
+    } catch {
+      throw MinutesError.network(error.localizedDescription)
+    }
+    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+    let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+    guard (200..<300).contains(status) else {
+      let message = ((json["error"] as? [String: Any])?["message"] as? String)
+        ?? String(data: data.prefix(300), encoding: .utf8) ?? ""
+      Log.write("minutes HTTP \(status) from \(provider.rawValue)")
+      throw MinutesError.http(status, message)
+    }
+    return json
+  }
+
+  // MARK: Model capabilities
+
+  private static func supportsEffort(_ model: String) -> Bool {
+    ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5", "claude-fable-5", "claude-mythos-5",
+     "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"]
+      .contains { model.hasPrefix($0) }
+  }
+
+  /// Server-side refusal fallback (`fallbacks: "default"`) is offered on these models.
+  private static func supportsFallbacks(_ model: String) -> Bool {
+    ["claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"].contains(model)
+  }
+
+  // MARK: Prompt
+
+  static let transcriptIntro = """
+    Meeting transcript so far. Each line is [hh:mm:ss from the start] speaker: text. It comes from \
+    automatic speech recognition, so expect misheard words, names and missing punctuation.
+    """
+
+  static func systemPrompt(language: String, instructions: String, final: Bool) -> String {
+    var prompt = """
+      You keep the minutes of a meeting\(final ? "" : " while it is still running"). You get the \
+      transcript\(final ? "" : " so far") and the current version of the minutes, if there is one. \
+      Return the complete \(final ? "final" : "updated") minutes in Markdown, written in \(language) \
+      whatever language the meeting is held in.
+
+      Use these sections, in this order, and leave out any that would be empty:
+      ### Summary
+      Two to four sentences: what the meeting is about and where it stands.
+      ### Decisions
+      ### Action items
+      One line each: "- [ ] Owner: task (due date if one was mentioned)". Use "?" when no owner was named.
+      ### Open questions
+      ### Notes
+      Key points, grouped under short bold topic names.
+
+      Keep items that are still accurate, revise the ones the conversation has changed, and never \
+      invent names, numbers, dates or commitments that aren't in the transcript. Speaker labels \
+      such as "Speaker 2" or "Others" are placeholders; use real names only when people are \
+      addressed or introduced by name. Return only the minutes, with no preamble.
+      """
+    if !final {
+      prompt += " The meeting is still going on, so don't treat the last topic as a conclusion."
+    }
+    let extra = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !extra.isEmpty {
+      prompt += "\n\nAdditional instructions from the user:\n\(extra)"
+    }
+    return prompt
+  }
+
+  static func requestText(previousMinutes: String?, final: Bool) -> String {
+    let previous = previousMinutes.map { "Current minutes:\n\n\($0)" } ?? "There are no minutes yet."
+    let ask = final
+      ? "The meeting has ended and the transcript above is complete, with speakers identified. Write the final minutes."
+      : "Update the minutes to cover the transcript so far."
+    return "\(previous)\n\n\(ask)"
+  }
+}
+
+/// Collects transcript lines during a meeting and refreshes the minutes on a timer.
+@MainActor
+final class MinutesRunner {
+  let config: MinutesConfig
+  private let client: MinutesClient
+  private var chunks: [String] = []
+  private var pendingLines: [String] = []
+  private var loop: Task<Void, Never>?
+  private var inFlight = false
+  private(set) var state: MinutesState
+  private let publish: (MinutesState) -> Void
+
+  init(config: MinutesConfig, publish: @escaping (MinutesState) -> Void) {
+    self.config = config
+    self.publish = publish
+    client = MinutesClient(provider: config.provider, model: config.model, apiKey: config.apiKey)
+    state = MinutesState(model: config.model, provider: config.provider)
+  }
+
+  /// Only the 5-minute cache stays warm between updates that start less than 5 minutes apart.
+  private var longCache: Bool { config.interval > 4 * 60 }
+
+  func start() {
+    schedule()
+    loop = Task { [weak self] in
+      while !Task.isCancelled {
+        guard let interval = self?.config.interval else { return }
+        try? await Task.sleep(for: .seconds(interval))
+        if Task.isCancelled { return }
+        await self?.update()
+      }
+    }
+  }
+
+  func stop() {
+    loop?.cancel()
+    loop = nil
+    state.nextUpdate = nil
+    publish(state)
+  }
+
+  func add(line: String) {
+    pendingLines.append(line)
+  }
+
+  /// "Update now" in the minutes pane; the timer keeps its own rhythm.
+  func updateNow() {
+    Task { await update() }
+  }
+
+  private func schedule() {
+    state.nextUpdate = Date().addingTimeInterval(config.interval)
+    publish(state)
+  }
+
+  private func update() async {
+    schedule()
+    guard !inFlight, !pendingLines.isEmpty else { return }
+    let newText = pendingLines.joined(separator: "\n")
+    // Wait for a little substance before the first update.
+    if chunks.isEmpty, newText.count < 150 { return }
+    chunks.append(newText)
+    pendingLines = []
+    inFlight = true
+    state.isUpdating = true
+    publish(state)
+    defer {
+      inFlight = false
+      state.isUpdating = false
+      publish(state)
+    }
+    do {
+      let result = try await client.minutes(
+        transcriptChunks: chunks, previousMinutes: state.text.isEmpty ? nil : state.text, config: config,
+        final: false, longCache: longCache)
+      state.text = result.text
+      state.updatedAt = Date()
+      state.error = nil
+      state.usage = state.usage + result.usage
+      state.cost = state.usage.estimatedCost(model: config.model, longCache: longCache)
+      Log.write("minutes updated: \(chunks.count) chunks, usage in=\(result.usage.input) cached=\(result.usage.cacheRead) written=\(result.usage.cacheWrite) out=\(result.usage.output)")
+    } catch {
+      state.error = error.localizedDescription
+      Log.write("minutes update failed: \(error)")
+    }
+  }
+
+  /// Final minutes from the finished transcript (with speaker names), using the live minutes as a draft.
+  func finalize(transcript: String) async -> String? {
+    stop()
+    guard !transcript.isEmpty else { return nil }
+    state.isUpdating = true
+    publish(state)
+    defer {
+      state.isUpdating = false
+      publish(state)
+    }
+    do {
+      let result = try await client.minutes(
+        transcriptChunks: [transcript], previousMinutes: state.text.isEmpty ? nil : state.text, config: config,
+        final: true, longCache: false)
+      state.text = result.text
+      state.updatedAt = Date()
+      state.error = nil
+      state.usage = state.usage + result.usage
+      state.cost = state.usage.estimatedCost(model: config.model, longCache: longCache)
+      Log.write("final minutes written, usage in=\(result.usage.input) out=\(result.usage.output)")
+      return result.text
+    } catch {
+      state.error = "Final minutes failed: \(error.localizedDescription)"
+      Log.write("final minutes failed: \(error)")
+      return nil
+    }
+  }
+
+}
+
+struct MinutesState: Equatable {
+  var text = ""
+  var updatedAt: Date?
+  var nextUpdate: Date?
+  var isUpdating = false
+  var error: String?
+  var usage = MinutesUsage()
+  /// Rough USD cost so far (known Claude models only).
+  var cost: Double?
+  var model: String
+  var provider: MinutesProvider
+}

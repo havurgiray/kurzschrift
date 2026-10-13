@@ -14,6 +14,8 @@ struct SettingsView: View {
         .tabItem { Label("Translate", systemImage: "character.bubble") }
       TranscriptionSettings(settings: settings)
         .tabItem { Label("Transcribe", systemImage: "text.bubble") }
+      MinutesSettings(settings: settings)
+        .tabItem { Label("Minutes", systemImage: "list.bullet.clipboard") }
       MicrophoneSettings(settings: settings)
         .tabItem { Label("Microphone", systemImage: "mic") }
     }
@@ -98,7 +100,6 @@ private struct TranslationSettings: View {
       Section {
         Toggle("Include my microphone", isOn: $settings.translateIncludeMic)
         Toggle("Identify speakers (Speaker 1, Speaker 2, …)", isOn: $settings.translateSeparateSpeakers)
-        Toggle("Show the original text in the live window", isOn: $settings.translateShowOriginalLive)
         Picker("Transcript layout", selection: $settings.translateLayout) {
           Text("Each passage in both languages").tag(TranscriptLayout.interleaved.rawValue)
           Text("Full original, then full translation").tag(TranscriptLayout.sections.rawValue)
@@ -139,6 +140,102 @@ private struct TranscriptionSettings: View {
     .formStyle(.grouped)
     .task {
       speechLocales = await SpeechTranscriber.supportedLocales.map { $0.identifier(.bcp47) }.sorted()
+    }
+  }
+}
+
+private struct MinutesSettings: View {
+  @ObservedObject var settings: AppSettings
+  @State private var apiKey = ""
+  @State private var models: [String] = []
+  @State private var testState: TestState = .idle
+
+  private enum TestState: Equatable {
+    case idle, testing, ok(Int), failed(String)
+  }
+
+  var body: some View {
+    Form {
+      Section {
+        Toggle("Translate meetings", isOn: $settings.minutesForTranslate)
+        Toggle("Transcribe meetings", isOn: $settings.minutesForTranscribe)
+        Picker("Update every", selection: $settings.minutesIntervalMinutes) {
+          ForEach(AppSettings.minutesIntervalChoices, id: \.self) { Text("\($0) min").tag($0) }
+        }
+        Text(
+          "While a meeting runs, the transcript is sent to \(settings.provider.displayName) to keep the minutes up to date, and once more at the end for the final minutes, which go into the transcript file. Everything else stays on this Mac."
+        )
+        .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Live minutes")
+      }
+
+      Section("Provider") {
+        Picker("Provider", selection: $settings.minutesProvider) {
+          ForEach(MinutesProvider.allCases) { Text($0.displayName).tag($0.rawValue) }
+        }
+        LabeledContent("API key") {
+          HStack {
+            SecureField("", text: $apiKey, prompt: Text("Paste your key"))
+              .onChange(of: apiKey) { APIKeyStore.setKey(apiKey, for: settings.provider) }
+            Link("Get a key", destination: settings.provider.keysPage)
+          }
+        }
+        LabeledContent("Model") {
+          HStack {
+            TextField("", text: Binding(get: { settings.minutesModel }, set: { settings.minutesModel = $0 }),
+              prompt: Text(settings.provider == .openai ? "Test the key to list models" : "claude-opus-5-5"))
+            if !models.isEmpty {
+              Menu("Choose") {
+                ForEach(models, id: \.self) { id in Button(id) { settings.minutesModel = id } }
+              }
+              .fixedSize()
+            }
+          }
+        }
+        HStack {
+          Button("Test Key") { Task { await test() } }
+            .disabled(apiKey.isEmpty || testState == .testing)
+          switch testState {
+          case .idle: EmptyView()
+          case .testing: ProgressView().controlSize(.small)
+          case .ok(let count): Label("Key works (\(count) models)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+          case .failed(let message): Label(message, systemImage: "xmark.octagon.fill").foregroundStyle(.red).lineLimit(2)
+          }
+        }
+        Text("The key is stored in ~/Library/Application Support/Kurzschrift/api-keys.json, readable only by your user account.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+
+      Section("Extra instructions (optional)") {
+        TextEditor(text: $settings.minutesInstructions)
+          .font(.body)
+          .frame(height: 60)
+        Text("For example: “Focus on action items for me.” or “Use the project names Atlas and Nimbus.”")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+    }
+    .formStyle(.grouped)
+    .onAppear(perform: loadKey)
+    .onChange(of: settings.minutesProvider) { loadKey() }
+  }
+
+  private func loadKey() {
+    apiKey = APIKeyStore.key(for: settings.provider) ?? ""
+    models = []
+    testState = .idle
+  }
+
+  private func test() async {
+    testState = .testing
+    let client = MinutesClient(provider: settings.provider, model: settings.minutesModel, apiKey: apiKey)
+    do {
+      let found = try await client.listModels()
+      models = found
+      testState = .ok(found.count)
+      if settings.minutesModel.isEmpty, let first = found.first { settings.minutesModel = first }
+    } catch {
+      testState = .failed(error.localizedDescription)
     }
   }
 }

@@ -29,13 +29,22 @@ final class AppSettings: ObservableObject {
   @Published var translateTarget: String { didSet { defaults.set(translateTarget, forKey: "translateTarget") } }
   @Published var translateIncludeMic: Bool { didSet { defaults.set(translateIncludeMic, forKey: "translateIncludeMic") } }
   @Published var translateSeparateSpeakers: Bool { didSet { defaults.set(translateSeparateSpeakers, forKey: "translateSeparateSpeakers") } }
-  @Published var translateShowOriginalLive: Bool { didSet { defaults.set(translateShowOriginalLive, forKey: "translateShowOriginalLive") } }
   @Published var translateLayout: String { didSet { defaults.set(translateLayout, forKey: "translateLayout") } }
 
   // Transcription meetings (use case 2)
   @Published var transcribeLocale: String { didSet { defaults.set(transcribeLocale, forKey: "transcribeLocale") } }
   @Published var transcribeIncludeMic: Bool { didSet { defaults.set(transcribeIncludeMic, forKey: "transcribeIncludeMic") } }
   @Published var transcribeSeparateSpeakers: Bool { didSet { defaults.set(transcribeSeparateSpeakers, forKey: "transcribeSeparateSpeakers") } }
+
+  // Live minutes (sent to an LLM provider; off by default)
+  @Published var minutesForTranslate: Bool { didSet { defaults.set(minutesForTranslate, forKey: "minutesForTranslate") } }
+  @Published var minutesForTranscribe: Bool { didSet { defaults.set(minutesForTranscribe, forKey: "minutesForTranscribe") } }
+  @Published var minutesProvider: String { didSet { defaults.set(minutesProvider, forKey: "minutesProvider") } }
+  @Published var minutesModelAnthropic: String { didSet { defaults.set(minutesModelAnthropic, forKey: "minutesModel.anthropic") } }
+  @Published var minutesModelOpenAI: String { didSet { defaults.set(minutesModelOpenAI, forKey: "minutesModel.openai") } }
+  @Published var minutesIntervalMinutes: Int { didSet { defaults.set(minutesIntervalMinutes, forKey: "minutesIntervalMinutes") } }
+  @Published var minutesInstructions: String { didSet { defaults.set(minutesInstructions, forKey: "minutesInstructions") } }
+  static let minutesIntervalChoices = [1, 2, 3, 5, 10]
 
   // Microphone
   @Published var micDeviceUID: String { didSet { defaults.set(micDeviceUID, forKey: "micDeviceUID") } }
@@ -55,11 +64,17 @@ final class AppSettings: ObservableObject {
       "translateTarget": "en-US",
       "translateIncludeMic": false,
       "translateSeparateSpeakers": true,
-      "translateShowOriginalLive": true,
       "translateLayout": TranscriptLayout.interleaved.rawValue,
       "transcribeLocale": "en-US",
       "transcribeIncludeMic": true,
       "transcribeSeparateSpeakers": true,
+      "minutesForTranslate": false,
+      "minutesForTranscribe": false,
+      "minutesProvider": MinutesProvider.anthropic.rawValue,
+      "minutesModel.anthropic": MinutesProvider.anthropic.defaultModel,
+      "minutesModel.openai": MinutesProvider.openai.defaultModel,
+      "minutesIntervalMinutes": 3,
+      "minutesInstructions": "",
       "micDeviceUID": "",
       "micShared": false,
     ])
@@ -73,11 +88,17 @@ final class AppSettings: ObservableObject {
     translateTarget = d.string(forKey: "translateTarget")!
     translateIncludeMic = d.bool(forKey: "translateIncludeMic")
     translateSeparateSpeakers = d.bool(forKey: "translateSeparateSpeakers")
-    translateShowOriginalLive = d.bool(forKey: "translateShowOriginalLive")
     translateLayout = d.string(forKey: "translateLayout")!
     transcribeLocale = d.string(forKey: "transcribeLocale")!
     transcribeIncludeMic = d.bool(forKey: "transcribeIncludeMic")
     transcribeSeparateSpeakers = d.bool(forKey: "transcribeSeparateSpeakers")
+    minutesForTranslate = d.bool(forKey: "minutesForTranslate")
+    minutesForTranscribe = d.bool(forKey: "minutesForTranscribe")
+    minutesProvider = d.string(forKey: "minutesProvider")!
+    minutesModelAnthropic = d.string(forKey: "minutesModel.anthropic")!
+    minutesModelOpenAI = d.string(forKey: "minutesModel.openai")!
+    minutesIntervalMinutes = d.integer(forKey: "minutesIntervalMinutes")
+    minutesInstructions = d.string(forKey: "minutesInstructions")!
     micDeviceUID = d.string(forKey: "micDeviceUID")!
     micShared = d.bool(forKey: "micShared")
   }
@@ -94,6 +115,33 @@ final class AppSettings: ObservableObject {
     }
   }
 
+  var provider: MinutesProvider { MinutesProvider(rawValue: minutesProvider) ?? .anthropic }
+
+  var minutesModel: String {
+    get { provider == .anthropic ? minutesModelAnthropic : minutesModelOpenAI }
+    set { if provider == .anthropic { minutesModelAnthropic = newValue } else { minutesModelOpenAI = newValue } }
+  }
+
+  func minutesEnabled(for mode: MeetingMode) -> Bool {
+    mode == .translate ? minutesForTranslate : minutesForTranscribe
+  }
+
+  /// nil when minutes are off for this mode, or on but missing a key or model (`minutesProblem` says which).
+  func minutesConfig(for mode: MeetingMode) -> MinutesConfig? {
+    guard minutesEnabled(for: mode), let key = APIKeyStore.key(for: provider), !minutesModel.isEmpty else { return nil }
+    let language = mode == .translate ? Self.languageName(translateTarget) : Self.languageName(transcribeLocale)
+    return MinutesConfig(
+      provider: provider, model: minutesModel, apiKey: key, interval: TimeInterval(max(1, minutesIntervalMinutes) * 60),
+      language: language, instructions: minutesInstructions)
+  }
+
+  func minutesProblem(for mode: MeetingMode) -> String? {
+    guard minutesEnabled(for: mode) else { return nil }
+    if APIKeyStore.key(for: provider) == nil { return "Live minutes are on, but no \(provider.displayName) API key is set (Settings → Minutes)." }
+    if minutesModel.isEmpty { return "Live minutes are on, but no model is chosen (Settings → Minutes)." }
+    return nil
+  }
+
   /// Frozen copy of the settings a session runs with, so edits mid-meeting don't half-apply.
   func snapshot(for mode: MeetingMode) -> SessionConfig {
     switch mode {
@@ -104,14 +152,15 @@ final class AppSettings: ObservableObject {
         includeMic: translateIncludeMic, separateSpeakers: translateSeparateSpeakers,
         micDeviceUID: micDeviceUID, micShared: micShared, myName: myName.isEmpty ? "Me" : myName,
         saveFolder: URL(fileURLWithPath: (saveFolder as NSString).expandingTildeInPath),
-        keepAudio: keepAudio, layout: TranscriptLayout(rawValue: translateLayout) ?? .interleaved)
+        keepAudio: keepAudio, layout: TranscriptLayout(rawValue: translateLayout) ?? .interleaved,
+        minutes: minutesConfig(for: mode))
     case .transcribe:
       SessionConfig(
         mode: mode, spokenLocale: Locale(identifier: transcribeLocale), targetLanguage: nil,
         includeMic: transcribeIncludeMic, separateSpeakers: transcribeSeparateSpeakers,
         micDeviceUID: micDeviceUID, micShared: micShared, myName: myName.isEmpty ? "Me" : myName,
         saveFolder: URL(fileURLWithPath: (saveFolder as NSString).expandingTildeInPath),
-        keepAudio: keepAudio, layout: .interleaved)
+        keepAudio: keepAudio, layout: .interleaved, minutes: minutesConfig(for: mode))
     }
   }
 
@@ -158,4 +207,5 @@ struct SessionConfig {
   var saveFolder: URL
   var keepAudio: Bool
   let layout: TranscriptLayout
+  var minutes: MinutesConfig?
 }

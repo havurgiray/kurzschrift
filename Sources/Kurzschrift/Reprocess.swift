@@ -6,7 +6,7 @@ import Foundation
 ///     Kurzschrift --reprocess --mode transcribe|translate --system "meeting audio.wav" \
 ///         [--mic "microphone.wav"] [--out folder] [--verbose]
 ///
-/// Uses the current settings (language, speakers, layout, your name).
+/// Uses the current settings (language, speakers, layout, your name, and minutes if they're on for the mode).
 enum Reprocess {
   static let flag = "--reprocess"
 
@@ -97,7 +97,21 @@ enum Reprocess {
       .map { Double($0.length) / $0.fileFormat.sampleRate }.max() ?? 0
     let end = Date()
     let document = try TranscriptDocument(config: config, startedAt: end.addingTimeInterval(-duration))
-    document.writeFinal(turns: turns, endedAt: end, notes: notes, audioFiles: [])
+    var minutes: String?
+    if let minutesConfig = config.minutes {
+      let transcript = turns.map { "[\(TranscriptDocument.clock($0.start))] \($0.speaker ?? "Speaker"): \($0.text)" }
+        .joined(separator: "\n")
+      let client = MinutesClient(provider: minutesConfig.provider, model: minutesConfig.model, apiKey: minutesConfig.apiKey)
+      do {
+        let result = try await client.minutes(
+          transcriptChunks: [transcript], previousMinutes: nil, config: minutesConfig, final: true, longCache: false)
+        minutes = result.text
+        FileHandle.standardError.write(Data("minutes: \(minutesConfig.model), in=\(result.usage.input) out=\(result.usage.output)\n".utf8))
+      } catch {
+        notes.append("Minutes couldn't be written: \(error.localizedDescription)")
+      }
+    }
+    document.writeFinal(turns: turns, endedAt: end, notes: notes, audioFiles: [], minutes: minutes)
     return document.url
   }
 }
