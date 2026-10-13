@@ -4,7 +4,7 @@ import Speech
 import Translation
 
 struct TimedWord {
-  let text: String  // as recognized, including its leading space and trailing punctuation
+  var text: String  // as recognized, including its leading space and trailing punctuation
   let start: Double
   let end: Double
 }
@@ -13,10 +13,32 @@ struct TimedWord {
 struct FinalSegment: Identifiable {
   let id = UUID()
   let source: AudioSourceKind
-  let text: String
+  var text: String
   let start: Double
   let end: Double
-  let words: [TimedWord]
+  var words: [TimedWord]
+}
+
+/// The recognizer sometimes starts a result with the punctuation that ends the previous one
+/// (". Gut, dann…", "? Ja, das mache ich") and puts spaces before punctuation ("allen .").
+enum TextCleanup {
+  private static let punctuation: Set<Character> = [".", ",", "?", "!", ";", ":", "…"]
+
+  /// (".", "Gut, dann") for ". Gut, dann".
+  static func splitLeadingPunctuation(_ text: String) -> (lead: String, rest: String) {
+    let trimmed = text.drop { $0.isWhitespace }
+    let lead = trimmed.prefix { punctuation.contains($0) || $0.isWhitespace }
+    return (lead.filter { !$0.isWhitespace }, String(trimmed.dropFirst(lead.count)))
+  }
+
+  static func endsWithPunctuation(_ text: String) -> Bool {
+    text.trimmingCharacters(in: .whitespaces).last.map { punctuation.contains($0) } ?? false
+  }
+
+  static func tidy(_ text: String) -> String {
+    text.replacingOccurrences(of: #"\s+([.,?!;:…])"#, with: "$1", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
 }
 
 enum SpeechEvent {
