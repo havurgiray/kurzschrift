@@ -23,11 +23,27 @@ enum Diarization {
     }
   }
 
-  static func speakers(in wav: URL) async throws -> [SpeakerSpan] {
+  struct Result {
+    let spans: [SpeakerSpan]
+    /// Voice embedding per speaker id, when the diarizer provided them.
+    let voices: [String: [Float]]
+  }
+
+  static func speakers(in wav: URL) async throws -> Result {
     let output = wav.deletingPathExtension().appendingPathExtension("speakers.json")
+    let voicesFile = voicesURL(for: output)
     try await runHelper([diarizeFlag, wav.path, output.path])
-    defer { try? FileManager.default.removeItem(at: output) }
-    return mergingEdgeFragments(try JSONDecoder().decode([SpeakerSpan].self, from: Data(contentsOf: output)))
+    defer {
+      try? FileManager.default.removeItem(at: output)
+      try? FileManager.default.removeItem(at: voicesFile)
+    }
+    let spans = mergingEdgeFragments(try JSONDecoder().decode([SpeakerSpan].self, from: Data(contentsOf: output)))
+    let voices = (try? JSONDecoder().decode([String: [Float]].self, from: Data(contentsOf: voicesFile))) ?? [:]
+    return Result(spans: spans, voices: voices)
+  }
+
+  static func voicesURL(for spansFile: URL) -> URL {
+    spansFile.deletingPathExtension().appendingPathExtension("voices.json")
   }
 
   /// The segmentation model works in fixed 10 s windows, and speech that starts or ends right on a
@@ -99,6 +115,10 @@ enum Diarization {
             SpeakerSpan(speaker: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
           }
           try JSONEncoder().encode(spans).write(to: URL(fileURLWithPath: args[3]))
+          // One voice embedding per speaker, for recognizing people again in later meetings.
+          if let voices = result.speakerDatabase {
+            try JSONEncoder().encode(voices).write(to: Self.voicesURL(for: URL(fileURLWithPath: args[3])))
+          }
         }
         exit(0)
       } catch {
