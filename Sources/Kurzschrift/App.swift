@@ -21,6 +21,13 @@ struct KurzschriftApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    MainActor.assumeIsolated {
+      HotKeys.shared.apply(enabled: AppSettings.shared.globalShortcuts)
+      CallDetector.shared.apply()
+    }
+  }
+
   func applicationWillFinishLaunching(_ notification: Notification) {
     NSAppleEventManager.shared().setEventHandler(
       self, andSelector: #selector(handleURLEvent(_:reply:)),
@@ -34,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       let components = URLComponents(string: string), let action = components.host
     else { return }
     let mode = components.queryItems?.first { $0.name == "mode" }?.value.flatMap(MeetingMode.init(rawValue:))
+    func query(_ name: String) -> String? { components.queryItems?.first { $0.name == name }?.value }
     Log.write("url: \(string)")
     Task { @MainActor in
       let session = SessionController.shared
@@ -43,10 +51,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let mode { await session.start(mode, testAudio: audio) }
       case "stop": await session.stop()
       case "minutes": session.updateMinutesNow()
+      case "bookmark": session.addBookmark()
       case "snapshot":
-        if let path = components.queryItems?.first(where: { $0.name == "path" })?.value {
-          LiveWindowController.shared.snapshot(to: path)
+        if let path = query("path") {
+          if query("window") == "subtitles" {
+            SubtitleController.shared.snapshot(to: path)
+          } else {
+            LiveWindowController.shared.snapshot(to: path)
+          }
         }
+      case "rename":
+        if let from = query("from"), let to = query("to") {
+          session.renameSpeaker(from, to: to, remember: query("remember") != "no")
+        }
+      case "ask":
+        if let question = query("q") { session.ask(question) }
       case "toggle":
         if session.isRecording { await session.stop() } else if let mode { await session.start(mode) }
       default: break
@@ -114,6 +133,8 @@ private struct MenuContent: View {
       Text(session.config?.mode == .translate ? "Translating…" : "Transcribing…")
       Button("Stop and Save") { Task { await session.stop() } }
         .keyboardShortcut("s")
+      Button("Bookmark This Moment") { session.addBookmark() }
+        .keyboardShortcut("b")
     }
 
     Divider()
@@ -130,6 +151,8 @@ private struct MenuContent: View {
       if let url = session.lastTranscript { NSWorkspace.shared.open(url) }
     }
     .disabled(session.lastTranscript == nil)
+    Toggle("Subtitles", isOn: $settings.subtitles)
+      .keyboardShortcut("t")
     Picker("Live Update Interval", selection: $settings.liveUpdateMilliseconds) {
       ForEach(AppSettings.liveUpdateChoices, id: \.self) { ms in
         Text(AppSettings.intervalName(ms)).tag(ms)

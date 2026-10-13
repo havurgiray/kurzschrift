@@ -81,6 +81,12 @@ struct MinutesConfig {
   /// Language the minutes are written in, e.g. "English".
   let language: String
   let instructions: String
+
+  func adding(instructions extra: String) -> MinutesConfig {
+    MinutesConfig(
+      provider: provider, model: model, apiKey: apiKey, interval: interval, language: language,
+      instructions: instructions + "\n" + extra)
+  }
 }
 
 struct MinutesUsage: Equatable {
@@ -161,11 +167,30 @@ final class MinutesClient: @unchecked Sendable {
   ) async throws -> (text: String, usage: MinutesUsage) {
     let system = Self.systemPrompt(language: config.language, instructions: config.instructions, final: final)
     let tail = Self.requestText(previousMinutes: previousMinutes, final: final)
+    return try await sendWithRetry(
+      system: system, chunks: transcriptChunks, tail: tail, effort: final ? "medium" : "low", longCache: longCache)
+  }
+
+  /// Answers a question about the meeting from its transcript (the "Ask" tab).
+  func answer(question: String, transcript: String, language: String) async throws -> (text: String, usage: MinutesUsage) {
+    let system = """
+      You answer questions about a meeting from its transcript, which comes from automatic speech \
+      recognition, so expect misheard words and names. Answer in \(language), briefly, and cite the \
+      times you rely on as [hh:mm:ss]. If the transcript doesn't contain the answer, say so instead of \
+      guessing.
+      """
+    return try await sendWithRetry(
+      system: system, chunks: [transcript], tail: "Question: \(question)", effort: "low", longCache: false)
+  }
+
+  private func sendWithRetry(system: String, chunks: [String], tail: String, effort: String, longCache: Bool)
+    async throws -> (text: String, usage: MinutesUsage)
+  {
     do {
-      return try await send(system: system, chunks: transcriptChunks, tail: tail, final: final, longCache: longCache)
+      return try await send(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
     } catch let error as MinutesError where error.isRetryable {
       try await Task.sleep(for: .seconds(3))
-      return try await send(system: system, chunks: transcriptChunks, tail: tail, final: final, longCache: longCache)
+      return try await send(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
     }
   }
 
@@ -196,16 +221,16 @@ final class MinutesClient: @unchecked Sendable {
 
   // MARK: Requests
 
-  private func send(system: String, chunks: [String], tail: String, final: Bool, longCache: Bool) async throws
+  private func send(system: String, chunks: [String], tail: String, effort: String, longCache: Bool) async throws
     -> (text: String, usage: MinutesUsage)
   {
     switch provider {
-    case .anthropic: try await sendAnthropic(system: system, chunks: chunks, tail: tail, final: final, longCache: longCache)
+    case .anthropic: try await sendAnthropic(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
     case .openai: try await sendOpenAI(system: system, chunks: chunks, tail: tail)
     }
   }
 
-  private func sendAnthropic(system: String, chunks: [String], tail: String, final: Bool, longCache: Bool)
+  private func sendAnthropic(system: String, chunks: [String], tail: String, effort: String, longCache: Bool)
     async throws -> (text: String, usage: MinutesUsage)
   {
     var content: [[String: Any]] = [["type": "text", "text": Self.transcriptIntro]]
@@ -225,7 +250,7 @@ final class MinutesClient: @unchecked Sendable {
       "messages": [["role": "user", "content": content]],
     ]
     if Self.supportsEffort(model) {
-      body["output_config"] = ["effort": final ? "medium" : "low"]
+      body["output_config"] = ["effort": effort]
     }
     let useFallbacks = Self.supportsFallbacks(model) && !fallbacksRejected
     if useFallbacks { body["fallbacks"] = "default" }
@@ -245,7 +270,7 @@ final class MinutesClient: @unchecked Sendable {
     } catch MinutesError.http(400, let message) where useFallbacks && message.contains("fallback") {
       // The account doesn't have the fallback beta: carry on without it.
       fallbacksRejected = true
-      return try await sendAnthropic(system: system, chunks: chunks, tail: tail, final: final, longCache: longCache)
+      return try await sendAnthropic(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
     }
 
     if json["stop_reason"] as? String == "refusal" {

@@ -20,6 +20,9 @@ final class LiveWindowController {
       panel.hidesOnDeactivate = false
       panel.isReleasedWhenClosed = false
       panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+      // Takes keyboard focus only when you click into the question field, so typing in Teams
+      // never lands here by accident.
+      panel.becomesKeyOnlyIfNeeded = true
       panel.contentView = NSHostingView(rootView: LiveTranscriptView(session: .shared, settings: .shared))
       panel.setFrameAutosaveName("MeetingWindow")
       if panel.frame.origin == .zero { panel.center() }
@@ -44,7 +47,7 @@ struct LiveTranscriptView: View {
   @ObservedObject var settings: AppSettings
 
   private var translating: Bool { session.config?.mode == .translate }
-  private var showsMinutes: Bool { session.minutes != nil }
+  private var showsSidePane: Bool { session.minutes != nil || session.canAsk }
 
   var body: some View {
     VStack(spacing: 0) {
@@ -58,11 +61,11 @@ struct LiveTranscriptView: View {
           .frame(maxWidth: .infinity, alignment: .leading)
           .background(.orange.opacity(0.1))
       }
-      if showsMinutes {
+      if showsSidePane {
         HSplitView {
           TranscriptPane(session: session, translating: translating, fontSize: settings.liveFontSize)
             .frame(minWidth: 280, maxWidth: .infinity, maxHeight: .infinity)
-          MinutesPane(session: session, fontSize: settings.liveFontSize)
+          SidePane(session: session, fontSize: settings.liveFontSize)
             .frame(minWidth: 240, idealWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
         }
       } else {
@@ -97,6 +100,12 @@ struct LiveTranscriptView: View {
         }
       }
       Spacer()
+      if let seconds = session.autoStopIn {
+        Label("No speech: stopping in \(seconds) s", systemImage: "timer")
+          .foregroundStyle(.orange)
+          .monospacedDigit()
+        Button("Keep Recording") { session.keepRecording() }
+      }
       if session.canExport {
         Menu {
           Button("Save as Markdown…") { session.exportWithSavePanel(.markdown) }
@@ -111,6 +120,12 @@ struct LiveTranscriptView: View {
         .help("Export the transcript, translation and minutes as they are right now")
       }
       if session.isRecording {
+        Button {
+          session.addBookmark()
+        } label: {
+          Image(systemName: "star")
+        }
+        .help("Bookmark this moment (⌃⌥B)")
         Button("Stop & Save") { Task { await session.stop() } }
       } else if session.isIdle {
         Menu("Start") {
@@ -167,14 +182,13 @@ private struct TranscriptPane: View {
               .foregroundStyle(.tertiary)
           }
           ForEach(session.entries) { entry in
-            EntryView(entry: entry, translating: translating, fontSize: fontSize)
+            EntryView(entry: entry, translating: translating, fontSize: fontSize, session: session)
           }
           Color.clear.frame(height: 1).id("bottom")
         }
         .textSelection(.enabled)
         .padding(14)
       }
-      .defaultScrollAnchor(.bottom)
       // Only scrolling done by the user changes whether the pane follows; new lines arriving and
       // the pane's own scrolling to them don't.
       .onScrollPhaseChange { _, phase in
@@ -211,11 +225,23 @@ private struct EntryView: View {
   let entry: SessionController.LiveEntry
   let translating: Bool
   let fontSize: Double
+  @ObservedObject var session: SessionController
 
   var body: some View {
+    if entry.isBookmark {
+      Label("Bookmark · \(TranscriptDocument.clock(entry.start))", systemImage: "star.fill")
+        .font(.system(size: max(10, fontSize - 2), weight: .semibold))
+        .foregroundStyle(.orange)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    } else {
+      text
+    }
+  }
+
+  private var text: some View {
     VStack(alignment: .leading, spacing: 4) {
       HStack(spacing: 6) {
-        if let speaker = entry.speaker { Text(speaker).fontWeight(.semibold) }
+        if let speaker = entry.speaker { SpeakerLabel(name: speaker, session: session) }
         Text(TranscriptDocument.clock(entry.start)).foregroundStyle(.tertiary).monospacedDigit()
       }
       .font(.system(size: max(10, fontSize - 3)))
@@ -227,6 +253,60 @@ private struct EntryView: View {
       }
     }
     .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+/// After a meeting, click a speaker's name to rename them everywhere (and optionally remember the
+/// voice for next time).
+private struct SpeakerLabel: View {
+  let name: String
+  @ObservedObject var session: SessionController
+  @State private var editing = false
+  @State private var newName = ""
+  @State private var remember = true
+
+  var body: some View {
+    if let finished = session.finished {
+      Button(name) {
+        newName = name.hasPrefix("Speaker ") || name == "Unknown speaker" ? "" : name
+        editing = true
+      }
+      .buttonStyle(.plain)
+      .fontWeight(.semibold)
+      .foregroundStyle(Color.accentColor)
+      .help("Rename this speaker")
+      .popover(isPresented: $editing, arrowEdge: .bottom) {
+        VStack(alignment: .leading, spacing: 10) {
+          Text("Rename “\(name)”").font(.headline)
+          TextField("Name", text: $newName).textFieldStyle(.roundedBorder).onSubmit(apply)
+          let used = Set(finished.turns.compactMap(\.speaker))
+          let suggestions = finished.config.attendees.filter { !used.contains($0) }
+          if !suggestions.isEmpty {
+            Text("From the calendar invite").font(.caption).foregroundStyle(.secondary)
+            ForEach(suggestions.prefix(8), id: \.self) { suggestion in
+              Button(suggestion) { newName = suggestion }.buttonStyle(.link)
+            }
+          }
+          Toggle("Remember this voice for next time", isOn: $remember)
+            .disabled(finished.voices[name] == nil)
+          HStack {
+            Spacer()
+            Button("Rename", action: apply)
+              .keyboardShortcut(.defaultAction)
+              .disabled(newName.trimmingCharacters(in: .whitespaces).isEmpty)
+          }
+        }
+        .padding(14)
+        .frame(width: 300)
+      }
+    } else {
+      Text(name).fontWeight(.semibold)
+    }
+  }
+
+  private func apply() {
+    session.renameSpeaker(name, to: newName, remember: remember)
+    editing = false
   }
 }
 
@@ -276,7 +356,89 @@ private struct CaptionStrip: View {
   }
 }
 
-// MARK: - Minutes
+// MARK: - Minutes and questions
+
+private struct SidePane: View {
+  @ObservedObject var session: SessionController
+  let fontSize: Double
+  @State private var tab = 0
+
+  var body: some View {
+    let hasMinutes = session.minutes != nil
+    let canAsk = session.canAsk || !session.questions.isEmpty
+    VStack(spacing: 0) {
+      if hasMinutes && canAsk {
+        Picker("", selection: $tab) {
+          Text("Minutes").tag(0)
+          Text("Ask").tag(1)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(8)
+        Divider()
+      }
+      if hasMinutes && (tab == 0 || !canAsk) {
+        MinutesPane(session: session, fontSize: fontSize)
+      } else {
+        AskPane(session: session, fontSize: fontSize)
+      }
+    }
+  }
+}
+
+/// Questions about the meeting, answered from the transcript so far.
+private struct AskPane: View {
+  @ObservedObject var session: SessionController
+  let fontSize: Double
+  @State private var question = ""
+
+  var body: some View {
+    VStack(spacing: 0) {
+      ScrollViewReader { proxy in
+        ScrollView {
+          LazyVStack(alignment: .leading, spacing: 16) {
+            if session.questions.isEmpty {
+              Text("Ask anything about the meeting so far, for example “What did they decide about the budget?” or “What do I need to do?”")
+                .foregroundStyle(.tertiary)
+            }
+            ForEach(session.questions) { item in
+              VStack(alignment: .leading, spacing: 6) {
+                Text(item.question).font(.system(size: fontSize - 1, weight: .semibold))
+                if let answer = item.answer {
+                  MarkdownView(text: answer, fontSize: fontSize - 1)
+                } else if let error = item.error {
+                  Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.callout)
+                } else {
+                  ProgressView().controlSize(.small)
+                }
+              }
+              .id(item.id)
+            }
+          }
+          .textSelection(.enabled)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(12)
+        }
+        .onChange(of: session.questions.count) {
+          if let last = session.questions.last { proxy.scrollTo(last.id, anchor: .bottom) }
+        }
+      }
+      Divider()
+      HStack {
+        TextField("Ask about this meeting…", text: $question)
+          .textFieldStyle(.roundedBorder)
+          .onSubmit(send)
+        Button("Ask", action: send).disabled(question.trimmingCharacters(in: .whitespaces).isEmpty)
+      }
+      .padding(10)
+    }
+  }
+
+  private func send() {
+    session.ask(question)
+    question = ""
+  }
+}
 
 private struct MinutesPane: View {
   @ObservedObject var session: SessionController
@@ -294,6 +456,7 @@ private struct MinutesPane: View {
             .controlSize(.small)
             .disabled(state?.isUpdating == true)
         }
+        RemindersButton(session: session, minutes: state?.text ?? "")
         Button {
           NSPasteboard.general.clearContents()
           NSPasteboard.general.setString(state?.text ?? "", forType: .string)
@@ -324,6 +487,62 @@ private struct MinutesPane: View {
       MinutesStatusLine(state: state, recording: session.isRecording)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+  }
+}
+
+/// Adds the minutes' action items to Apple Reminders, after letting you pick which.
+private struct RemindersButton: View {
+  @ObservedObject var session: SessionController
+  let minutes: String
+  @State private var showing = false
+  @State private var selected: Set<UUID> = []
+  @State private var items: [CalendarContext.ActionItem] = []
+  @State private var status: String?
+
+  var body: some View {
+    Button {
+      items = CalendarContext.actionItems(in: minutes)
+      selected = Set(items.map(\.id))
+      status = nil
+      showing = true
+    } label: {
+      Image(systemName: "checklist")
+    }
+    .controlSize(.small)
+    .help("Add action items to Reminders")
+    .disabled(CalendarContext.actionItems(in: minutes).isEmpty)
+    .popover(isPresented: $showing, arrowEdge: .bottom) {
+      VStack(alignment: .leading, spacing: 8) {
+        Text("Add to Reminders").font(.headline)
+        ForEach(items) { item in
+          Toggle(item.line, isOn: Binding(
+            get: { selected.contains(item.id) },
+            set: { on in if on { selected.insert(item.id) } else { selected.remove(item.id) } }))
+        }
+        if let status { Text(status).font(.callout).foregroundStyle(.secondary) }
+        HStack {
+          Spacer()
+          Button("Add \(selected.count)") { Task { await add() } }
+            .keyboardShortcut(.defaultAction)
+            .disabled(selected.isEmpty)
+        }
+      }
+      .padding(14)
+      .frame(width: 380)
+    }
+  }
+
+  private func add() async {
+    let chosen = items.filter { selected.contains($0.id) }
+    let title = session.finished?.document.baseName ?? session.config?.eventTitle ?? "a meeting"
+    do {
+      let list = try await CalendarContext.addReminders(
+        chosen, meetingTitle: title, myName: AppSettings.shared.myName)
+      status = "Added \(chosen.count) to “\(list)”."
+      selected = []
+    } catch {
+      status = error.localizedDescription
     }
   }
 }
