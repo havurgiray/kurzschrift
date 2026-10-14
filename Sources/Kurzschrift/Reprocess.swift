@@ -1,11 +1,14 @@
 import AVFoundation
 import Foundation
 
-/// Rebuilds a transcript from kept recordings, without the menu bar app or any permissions:
+/// Rebuilds a transcript from kept recordings (.m4a or .wav), without the menu bar app or any permissions:
 ///
-///     Kurzschrift --reprocess --mode transcribe|translate --system "meeting audio.wav" \
-///         [--mic "microphone.wav"] [--out folder] [--language de-DE] [--also en-US|none]
+///     Kurzschrift --reprocess --mode transcribe|translate --system "meeting audio.m4a" \
+///         [--mic "microphone.m4a"] [--out folder] [--language de-DE] [--also en-US|none]
 ///         [--start 2026-09-30T10:20:00+02:00] [--verbose]
+///
+/// For tuning language decisions: `--save-segments raw.json` keeps every recognizer's results
+/// before the decision, and `--load-segments raw.json` reuses them instead of recognizing again.
 ///
 /// Uses the current settings (language, speakers, layout, your name, and minutes if they're on for the mode).
 enum Reprocess {
@@ -20,7 +23,7 @@ enum Reprocess {
     }
     guard let mode = value("--mode").flatMap(MeetingMode.init(rawValue:)), let systemPath = value("--system") else {
       FileHandle.standardError.write(
-        Data("usage: Kurzschrift --reprocess --mode transcribe|translate --system a.wav [--mic b.wav] [--out folder]\n".utf8))
+        Data("usage: Kurzschrift --reprocess --mode transcribe|translate --system a.m4a [--mic b.m4a] [--out folder]\n".utf8))
       exit(2)
     }
     var files: [(AudioSourceKind, URL)] = [(.system, URL(fileURLWithPath: systemPath))]
@@ -55,7 +58,16 @@ enum Reprocess {
       secondLocale = try await SpeechPipeline.prepareModel(for: wanted)
     }
     let collector = SegmentCollector()
-    for (source, url) in files {
+    let args = CommandLine.arguments
+    func value(_ name: String) -> String? {
+      args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+    }
+    if let path = value("--load-segments") {
+      for segment in try JSONDecoder().decode([FinalSegment].self, from: Data(contentsOf: URL(fileURLWithPath: path))) {
+        await collector.add(segment)
+      }
+    }
+    for (source, url) in files where value("--load-segments") == nil {
       let pipeline = try await SpeechPipeline.make(source: source, locale: locale, vocabulary: config.vocabulary)
       pipeline.start { event in
         if case .final(let segment) = event { await collector.add(segment) }
@@ -99,6 +111,9 @@ enum Reprocess {
       await second?.finish()
     }
     var segments = await collector.segments.sorted { $0.start < $1.start }
+    if let path = value("--save-segments") {
+      try JSONEncoder().encode(segments).write(to: URL(fileURLWithPath: path))
+    }
     if let secondLocale {
       var decided: [FinalSegment] = []
       for source in Set(segments.map(\.source)) {
@@ -114,7 +129,7 @@ enum Reprocess {
       for s in segments {
         let echo = s.source == .microphone && TranscriptBuilder.isEcho(s, among: system) ? " [echo]" : ""
         FileHandle.standardError.write(
-          Data(String(format: "%@ %6.2f-%6.2f%@ %@\n", s.source.rawValue, s.start, s.end, echo, s.text).utf8))
+          Data(String(format: "%@ %6.2f-%6.2f %@ %.2f%@ %@\n", s.source.rawValue, s.start, s.end, s.locale, s.confidence, echo, s.text).utf8))
       }
     }
 
@@ -132,7 +147,10 @@ enum Reprocess {
 
     var turns = TranscriptBuilder.turns(segments: segments, speakers: speakers, config: config)
     if config.mode == .translate, let target = config.targetLanguage {
-      let translator = Translator(from: locale.language, to: target)
+      // From the spoken language, or from the second one when the first is already the target.
+      let from = ([locale] + (secondLocale.map { [$0] } ?? []))
+        .first { !LanguageArbiter.sameLanguage($0.identifier, target.minimalIdentifier) } ?? locale
+      let translator = Translator(from: from.language, to: target)
       for i in turns.indices {
         var parts: [String] = []
         for (index, piece) in turns[i].pieces.enumerated() {
