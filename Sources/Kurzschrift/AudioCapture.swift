@@ -3,7 +3,7 @@ import AudioTeeCore
 import CoreAudio
 import Foundation
 
-enum AudioSourceKind: String, Hashable, CaseIterable {
+enum AudioSourceKind: String, Hashable, CaseIterable, Codable {
   case system
   case microphone
 }
@@ -193,6 +193,47 @@ final class SystemAudioSource: AudioOutputHandler {
     buffer.frameLength = frames
     memcpy(buffer.mutableAudioBufferList.pointee.mBuffers.mData, pointer, Int(frames) * bytesPerFrame)
     track.receive(buffer)
+  }
+}
+
+// MARK: - Kept recording
+
+/// Saves a finished track next to the transcript. Speech recognition and speaker separation
+/// always work from the full-quality WAV; the copy you keep is compressed to AAC (.m4a, plays
+/// anywhere), or stays the original WAV when the bit rate is 0.
+enum KeptRecording {
+  /// Returns the saved file, or nil if it couldn't be saved. Falls back to the WAV if compressing fails.
+  static func save(_ wav: URL, as base: URL, kbps: Int) async -> URL? {
+    if kbps > 0 {
+      let target = base.appendingPathExtension("m4a")
+      do {
+        try await Task.detached(priority: .userInitiated) { try compress(wav, to: target, kbps: kbps) }.value
+        return target
+      } catch {
+        Log.write("compressing \(wav.lastPathComponent) failed: \(error); keeping the WAV")
+        try? FileManager.default.removeItem(at: target)
+      }
+    }
+    let target = base.appendingPathExtension("wav")
+    return (try? FileManager.default.moveItem(at: wav, to: target)) != nil ? target : nil
+  }
+
+  /// About 2 s per hour of audio on an M4.
+  static func compress(_ wav: URL, to target: URL, kbps: Int) throws {
+    let input = try AVAudioFile(forReading: wav, commonFormat: .pcmFormatInt16, interleaved: true)
+    let settings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatMPEG4AAC,
+      AVSampleRateKey: input.fileFormat.sampleRate,
+      AVNumberOfChannelsKey: input.fileFormat.channelCount,
+      AVEncoderBitRateKey: kbps * 1000,
+    ]
+    let output = try AVAudioFile(forWriting: target, settings: settings, commonFormat: .pcmFormatInt16, interleaved: true)
+    defer { output.close() }
+    guard let buffer = AVAudioPCMBuffer(pcmFormat: input.processingFormat, frameCapacity: 160_000) else { return }
+    while input.framePosition < input.length {
+      try input.read(into: buffer)
+      try output.write(from: buffer)
+    }
   }
 }
 
