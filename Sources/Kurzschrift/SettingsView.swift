@@ -39,7 +39,13 @@ private struct GeneralSettings: View {
             Button("Choose…", action: chooseFolder)
           }
         }
-        Toggle("Also keep the audio recording (WAV) next to each transcript", isOn: $settings.keepAudio)
+        Toggle("Keep the meeting recording next to each transcript", isOn: $settings.keepAudio)
+        Picker("Recording quality", selection: $settings.audioBitrate) {
+          ForEach(AppSettings.audioBitrateChoices, id: \.self) { Text(AppSettings.audioBitrateName($0)).tag($0) }
+        }
+        .disabled(!settings.keepAudio)
+        Text("Saved as .m4a (AAC), which plays anywhere. Transcription and speaker separation always use the full-quality recording; this only sets the size of the copy you keep. With your microphone on, there are two files.")
+          .font(.caption).foregroundStyle(.secondary)
       }
       Section {
         LabeledContent("Vocabulary") {
@@ -306,12 +312,22 @@ private struct MinutesSettings: View {
           .font(.caption).foregroundStyle(.secondary)
       }
 
-      Section("Extra instructions (optional)") {
-        TextEditor(text: $settings.minutesInstructions)
-          .font(.body)
-          .frame(height: 60)
-        Text("For example: “Focus on action items for me.” or “Use the project names Atlas and Nimbus.”")
-          .font(.caption).foregroundStyle(.secondary)
+      Section {
+        TextEditor(
+          text: Binding(
+            get: { settings.minutesPrompt.isEmpty ? MinutesClient.defaultPrompt : settings.minutesPrompt },
+            set: { settings.minutesPrompt = $0 == MinutesClient.defaultPrompt ? "" : $0 }))
+          .font(.callout)
+          .frame(minHeight: 300)
+        HStack(alignment: .top) {
+          Text("Kurzschrift adds the language to write in (\(AppSettings.languageName(settings.translateTarget)) for translated meetings, the meeting's language for transcribed ones), your vocabulary, the attendees from the calendar, and whether the meeting is still running. Keep action items as “- [ ]” lines so Add to Reminders can find them.")
+            .font(.caption).foregroundStyle(.secondary)
+          Spacer()
+          Button("Reset to Default") { settings.minutesPrompt = "" }
+            .disabled(settings.minutesPrompt.isEmpty)
+        }
+      } header: {
+        Text("Prompt")
       }
     }
     .formStyle(.grouped)

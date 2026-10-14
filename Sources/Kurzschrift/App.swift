@@ -66,6 +66,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
       case "ask":
         if let question = query("q") { session.ask(question) }
+      case "edit-minutes":
+        // Developer hook: step=begin, step=cancel, or text=… to edit the minutes in one go.
+        switch query("step") {
+        case "begin": session.beginEditingMinutes()
+        case "cancel": session.cancelEditingMinutes()
+        default:
+          session.beginEditingMinutes()
+          if let text = query("text") { session.minutesDraft = text }
+          session.finishEditingMinutes()
+        }
       case "toggle":
         if session.isRecording { await session.stop() } else if let mode { await session.start(mode) }
       default: break

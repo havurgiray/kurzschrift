@@ -219,6 +219,9 @@ final class TranscriptDocument {
 
   var baseName: String { url.deletingPathExtension().lastPathComponent }
 
+  /// AI minutes, or only your own notes when live minutes are off.
+  private var minutesHeading: String { config.minutes == nil ? "Notes" : "Minutes" }
+
   func writeDraft(entries: [SessionController.LiveEntry], minutes: String? = nil) {
     write(draftMarkdown(entries: entries, minutes: minutes))
   }
@@ -227,7 +230,7 @@ final class TranscriptDocument {
     var md = header(endedAt: nil, speakers: [])
     md += "_Recording in progress. Speakers are identified when the recording stops._\n\n"
     if let minutes, !minutes.isEmpty {
-      md += "## Minutes (live draft)\n\n\(minutes)\n\n## Transcript\n\n"
+      md += "## \(minutesHeading) (live draft)\n\n\(minutes)\n\n## Transcript\n\n"
     }
     for entry in entries {
       if entry.isBookmark {
@@ -266,7 +269,7 @@ final class TranscriptDocument {
       md += "Audio: " + audioFiles.map { "[\($0.lastPathComponent)](<\($0.lastPathComponent)>)" }.joined(separator: ", ") + "\n\n"
     }
     if let minutes, !minutes.isEmpty {
-      md += "## Minutes\n\n\(minutes)\n\n"
+      md += "## \(minutesHeading)\n\n\(minutes)\n\n"
     }
     if !qa.isEmpty {
       md += "## Questions\n\n"

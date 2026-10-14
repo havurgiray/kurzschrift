@@ -5,12 +5,15 @@ import UniformTypeIdentifiers
 
 enum SessionError: LocalizedError {
   case translationNotInstalled(from: String, to: String)
+  case nothingToTranslate(String)
   case microphoneDenied
 
   var errorDescription: String? {
     switch self {
     case .translationNotInstalled(let from, let to):
       "The \(from) → \(to) translation languages aren't downloaded yet."
+    case .nothingToTranslate(let language):
+      "People speak \(language), the language you translate into, so there's nothing to translate."
     case .microphoneDenied:
       "Kurzschrift isn't allowed to use the microphone."
     }
@@ -20,6 +23,8 @@ enum SessionError: LocalizedError {
     switch self {
     case .translationNotInstalled:
       "Open System Settings → General → Language & Region → Translation Languages… and download both languages."
+    case .nothingToTranslate:
+      "In Settings → Translate, set “People speak” to the meeting's language, or use Transcribe Meeting."
     case .microphoneDenied:
       "Allow it in System Settings → Privacy & Security → Microphone, or turn off “Include my microphone”."
     }
@@ -76,6 +81,8 @@ final class SessionController: ObservableObject {
   struct LivePartial: Equatable {
     var original = ""
     var translation: String?
+    /// In mixed-language meetings, the language the text is being recognized in.
+    var language: String?
   }
 
   @Published private(set) var phase: Phase = .idle {
@@ -88,6 +95,8 @@ final class SessionController: ObservableObject {
   @Published private(set) var livePartials: [AudioSourceKind: LivePartial] = [:]
   /// nil when live minutes are off for this meeting.
   @Published private(set) var minutes: MinutesState?
+  /// The minutes as you edit them in the minutes pane; nil when you're not editing.
+  @Published var minutesDraft: String?
   @Published private(set) var warning: String?
   @Published private(set) var lastTranscript: URL?
   /// Seconds until the recording stops by itself for lack of speech; set only in the last minute.
@@ -136,7 +145,7 @@ final class SessionController: ObservableObject {
         config.attendees = meeting.attendees
         if !meeting.attendees.isEmpty, let minutes = config.minutes {
           config.minutes = minutes.adding(
-            instructions: "Attendees from the calendar invite: " + meeting.attendees.joined(separator: ", "))
+            context: "Attendees from the calendar invite: " + meeting.attendees.joined(separator: ", "))
         }
       }
     }
@@ -149,6 +158,7 @@ final class SessionController: ObservableObject {
     finished = nil
     warning = AppSettings.shared.minutesProblem(for: mode)
     minutes = nil
+    minutesDraft = nil
     phase = .starting("Preparing speech recognition…")
     if AppSettings.shared.showLiveWindow { LiveWindowController.shared.show() }
 
@@ -157,11 +167,17 @@ final class SessionController: ObservableObject {
 
       if mode == .translate, let target = config.targetLanguage {
         phase = .starting("Preparing translation…")
-        guard await Translator.isInstalled(from: locale.language, to: target) else {
-          throw SessionError.translationNotInstalled(
-            from: AppSettings.languageName(locale.identifier), to: AppSettings.languageName(target.minimalIdentifier))
+        // From the spoken language, or from the second one when the first is already the target.
+        let candidates = [locale] + (config.secondLocale.map { [$0] } ?? [])
+        guard let from = candidates.first(where: { !LanguageArbiter.sameLanguage($0.identifier, target.minimalIdentifier) })
+        else {
+          throw SessionError.nothingToTranslate(AppSettings.languageName(locale.identifier))
         }
-        let translator = Translator(from: locale.language, to: target)
+        guard await Translator.isInstalled(from: from.language, to: target) else {
+          throw SessionError.translationNotInstalled(
+            from: AppSettings.languageName(from.identifier), to: AppSettings.languageName(target.minimalIdentifier))
+        }
+        let translator = Translator(from: from.language, to: target)
         _ = await translator.translateUncached("Hallo")  // loads the model before the first real sentence
         self.translator = translator
       }
@@ -175,6 +191,7 @@ final class SessionController: ObservableObject {
         phase = .starting("Preparing \(AppSettings.languageName(wanted.identifier)) recognition…")
         secondLocale = try? await SpeechPipeline.prepareModel(for: wanted)
       }
+      self.config?.secondLocale = secondLocale
 
       phase = .starting("Starting audio…")
       let sources: [AudioSourceKind] = config.includeMic ? [.system, .microphone] : [.system]
@@ -231,6 +248,9 @@ final class SessionController: ObservableObject {
         let runner = MinutesRunner(config: minutesConfig) { [weak self] state in self?.minutesChanged(state) }
         minutesRunner = runner
         runner.start()
+      } else {
+        // No AI minutes: the pane is for your own notes, saved with the transcript.
+        minutes = MinutesState(usesAI: false, model: "", provider: AppSettings.shared.provider)
       }
       Log.write("recording: sources=\(sources.map(\.rawValue)) locale=\(locale.identifier)")
     } catch {
@@ -251,6 +271,7 @@ final class SessionController: ObservableObject {
     }
     Log.write("stop: \(segments.count) segments so far")
     phase = .finishing("Finishing transcription…")
+    finishEditingMinutes()
     autoStopIn = nil
     previewTask?.cancel()
     systemSource?.stop()
@@ -326,14 +347,19 @@ final class SessionController: ObservableObject {
         finalMinutes = live
         notes.append("The final minutes couldn't be written (\(minutes?.error ?? "unknown error")); these are the last live minutes.")
       }
+    } else if let text = minutes?.text, !text.isEmpty {
+      finalMinutes = text  // your own notes
     }
 
     var audioFiles: [URL] = []
     if config.keepAudio {
+      phase = .finishing("Saving the recording…")
       for (source, track) in tracks.sorted(by: { $0.key.rawValue > $1.key.rawValue }) {
         let name = source == .system ? "meeting audio" : "microphone"
-        let target = config.saveFolder.appendingPathComponent("\(document.baseName) (\(name)).wav")
-        if (try? FileManager.default.moveItem(at: track.fileURL, to: target)) != nil { audioFiles.append(target) }
+        let base = config.saveFolder.appendingPathComponent("\(document.baseName) (\(name))")
+        if let saved = await KeptRecording.save(track.fileURL, as: base, kbps: config.audioBitrate) {
+          audioFiles.append(saved)
+        }
       }
     }
     finished = FinishedMeeting(
@@ -382,9 +408,13 @@ final class SessionController: ObservableObject {
     switch event {
     case .partial(let source, let raw, let language):
       // In mixed meetings, show in-progress text only from the language currently being spoken.
-      if let arbiter = arbiters[source], !LanguageArbiter.sameLanguage(language, arbiter.current) { return }
+      if let arbiter = arbiters[source] {
+        arbiter.notePartial(raw, language: language)
+        if !LanguageArbiter.sameLanguage(language, arbiter.current) { return }
+      }
       let text = TextCleanup.tidy(TextCleanup.splitLeadingPunctuation(raw).rest)
       livePartials[source, default: LivePartial()].original = text
+      if arbiters[source] != nil { livePartials[source]?.language = language }
       if let target = config?.targetLanguage, LanguageArbiter.sameLanguage(language, target.minimalIdentifier) {
         livePartials[source]?.translation = text  // already in the translation language
       } else if translator != nil {
@@ -604,7 +634,9 @@ final class SessionController: ObservableObject {
       return ""
     case .text:
       var lines: [String] = []
-      if let minutes = minutes?.text, !minutes.isEmpty { lines += ["MINUTES", "", minutes, "", "TRANSCRIPT", ""] }
+      if let minutes = minutes?.text, !minutes.isEmpty {
+        lines += [self.minutes?.usesAI == false ? "NOTES" : "MINUTES", "", minutes, "", "TRANSCRIPT", ""]
+      }
       for entry in entries {
         if entry.isBookmark {
           lines += ["[\(TranscriptDocument.clock(entry.start))] * BOOKMARK *", ""]
@@ -652,6 +684,37 @@ final class SessionController: ObservableObject {
 
   func updateMinutesNow() {
     minutesRunner?.updateNow()
+  }
+
+  func beginEditingMinutes() {
+    guard let minutes, minutesDraft == nil else { return }
+    minutesDraft = minutes.text
+    minutesRunner?.beginEditing()
+  }
+
+  /// During the meeting the next update builds on your version; afterwards it goes straight into the file.
+  func finishEditingMinutes() {
+    guard let draft = minutesDraft else { return }
+    minutesDraft = nil
+    if let minutesRunner {
+      minutesRunner.finishEditing(text: draft)
+    } else if phase != .idle, var state = minutes {
+      state.text = draft
+      minutes = state
+      document?.writeDraft(entries: entries, minutes: draft)
+    } else if var f = finished, var state = minutes, draft != state.text {
+      f.minutes = draft
+      finished = f
+      state.text = draft
+      minutes = state
+      rewriteFinished()
+    }
+  }
+
+  func cancelEditingMinutes() {
+    guard minutesDraft != nil else { return }
+    minutesDraft = nil
+    minutesRunner?.cancelEditing()
   }
 
   /// Translates the newest in-progress text at the live update interval (Settings, default 500 ms),
