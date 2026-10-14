@@ -23,7 +23,12 @@ final class LiveWindowController {
       // Takes keyboard focus only when you click into the question field, so typing in Teams
       // never lands here by accident.
       panel.becomesKeyOnlyIfNeeded = true
-      panel.contentView = NSHostingView(rootView: LiveTranscriptView(session: .shared, settings: .shared))
+      let hosting = NSHostingView(rootView: LiveTranscriptView(session: .shared, settings: .shared))
+      // The window's size is yours, not the content's: letting wrapped captions and the side pane
+      // feed their size back into the window's constraints looped until AppKit gave up and crashed.
+      hosting.sizingOptions = []
+      panel.contentView = hosting
+      panel.contentMinSize = NSSize(width: 360, height: 260)
       panel.setFrameAutosaveName("MeetingWindow")
       if panel.frame.origin == .zero { panel.center() }
       self.panel = panel

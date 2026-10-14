@@ -25,7 +25,9 @@ final class SubtitleController {
       panel.ignoresMouseEvents = true
       panel.level = .screenSaver
       panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-      panel.contentView = NSHostingView(rootView: SubtitleView(session: session, settings: settings))
+      let hosting = NSHostingView(rootView: SubtitleView(session: session, settings: settings))
+      hosting.sizingOptions = []  // the bar's frame is set in position(), never by its content
+      panel.contentView = hosting
       self.panel = panel
     }
     position()
