@@ -3,15 +3,17 @@ import Foundation
 import Speech
 import Translation
 
-struct TimedWord {
+struct TimedWord: Codable {
   var text: String  // as recognized, including its leading space and trailing punctuation
   let start: Double
   let end: Double
+  /// The recognizer's confidence in this word (0...1), when it gave one.
+  var confidence: Double?
 }
 
 /// A finalized stretch of speech from one source, with word timings on the session timeline.
-struct FinalSegment: Identifiable {
-  let id = UUID()
+struct FinalSegment: Identifiable, Codable {
+  var id = UUID()
   let source: AudioSourceKind
   var text: String
   let start: Double
@@ -216,11 +218,13 @@ final class SpeechPipeline: @unchecked Sendable {
     for run in text.runs {
       let piece = String(text[run.range].characters)
       if let range = run[AttributeScopes.SpeechAttributes.TimeRangeAttribute.self] {
-        words.append(TimedWord(text: untimedPrefix + piece, start: range.start.seconds, end: range.end.seconds))
+        words.append(TimedWord(
+          text: untimedPrefix + piece, start: range.start.seconds, end: range.end.seconds,
+          confidence: run[AttributeScopes.SpeechAttributes.ConfidenceAttribute.self]))
         untimedPrefix = ""
       } else if let last = words.popLast() {
         // Punctuation and spacing come without timing; attach them to the previous word.
-        words.append(TimedWord(text: last.text + piece, start: last.start, end: last.end))
+        words.append(TimedWord(text: last.text + piece, start: last.start, end: last.end, confidence: last.confidence))
       } else {
         untimedPrefix += piece
       }
