@@ -80,12 +80,15 @@ struct MinutesConfig {
   let interval: TimeInterval
   /// Language the minutes are written in, e.g. "English".
   let language: String
-  let instructions: String
+  /// The prompt from Settings → Minutes (the default unless edited).
+  let prompt: String
+  /// Context the app adds below the prompt: vocabulary, calendar attendees.
+  let context: String
 
-  func adding(instructions extra: String) -> MinutesConfig {
+  func adding(context extra: String) -> MinutesConfig {
     MinutesConfig(
-      provider: provider, model: model, apiKey: apiKey, interval: interval, language: language,
-      instructions: instructions + "\n" + extra)
+      provider: provider, model: model, apiKey: apiKey, interval: interval, language: language, prompt: prompt,
+      context: context.isEmpty ? extra : context + "\n" + extra)
   }
 }
 
@@ -163,10 +166,11 @@ final class MinutesClient: @unchecked Sendable {
   /// `transcriptChunks` only ever grows at the end, so the provider can cache everything but the
   /// newest chunk; the previous minutes and the request come after the cached part.
   func minutes(
-    transcriptChunks: [String], previousMinutes: String?, config: MinutesConfig, final: Bool, longCache: Bool
+    transcriptChunks: [String], previousMinutes: String?, edits: [MinutesEdit] = [], config: MinutesConfig,
+    final: Bool, longCache: Bool
   ) async throws -> (text: String, usage: MinutesUsage) {
-    let system = Self.systemPrompt(language: config.language, instructions: config.instructions, final: final)
-    let tail = Self.requestText(previousMinutes: previousMinutes, final: final)
+    let system = Self.systemPrompt(prompt: config.prompt, language: config.language, context: config.context)
+    let tail = Self.requestText(previousMinutes: previousMinutes, edits: edits, final: final)
     return try await sendWithRetry(
       system: system, chunks: transcriptChunks, tail: tail, effort: final ? "medium" : "low", longCache: longCache)
   }
@@ -357,48 +361,105 @@ final class MinutesClient: @unchecked Sendable {
     automatic speech recognition, so expect misheard words, names and missing punctuation.
     """
 
-  static func systemPrompt(language: String, instructions: String, final: Bool) -> String {
-    var prompt = """
-      You keep the minutes of a meeting\(final ? "" : " while it is still running"). You get the \
-      transcript\(final ? "" : " so far") and the current version of the minutes, if there is one. \
-      Return the complete \(final ? "final" : "updated") minutes in Markdown, written in \(language) \
-      whatever language the meeting is held in.
+  /// Shown and editable in Settings → Minutes. The same for live and final minutes, so it stays
+  /// cacheable; whether the meeting is still running goes in the request at the end.
+  static let defaultPrompt = """
+    You keep the minutes of a meeting. You get its transcript, possibly while the meeting is still \
+    running, and the current version of the minutes, if there is one. Return the complete minutes in \
+    Markdown.
 
-      Use these sections, in this order, and leave out any that would be empty:
-      ### Summary
-      Two to four sentences: what the meeting is about and where it stands.
-      ### Decisions
-      ### Action items
-      One line each: "- [ ] Owner: task (due date if one was mentioned)". Use "?" when no owner was named.
-      ### Open questions
-      ### Notes
-      Key points, grouped under short bold topic names.
+    Use these sections, in this order, and leave out any that would be empty:
+    ### Summary
+    Two to four sentences: what the meeting is about and where it stands.
+    ### Decisions
+    ### Action items
+    One line each: "- [ ] Owner: task (due date if one was mentioned)". Use "?" when no owner was named.
+    ### Open questions
+    ### Notes
+    Key points, grouped under short bold topic names.
 
-      Keep items that are still accurate, revise the ones the conversation has changed, and never \
-      invent names, numbers, dates or commitments that aren't in the transcript. Speaker labels \
-      such as "Speaker 2" or "Others" are placeholders; use real names only when people are \
-      addressed or introduced by name. Return only the minutes, with no preamble.
-      """
-    if !final {
-      prompt += " The meeting is still going on, so don't treat the last topic as a conclusion."
-    }
-    let extra = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !extra.isEmpty {
-      prompt += "\n\nAdditional instructions from the user:\n\(extra)"
-    }
-    return prompt
+    Keep items that are still accurate, revise the ones the conversation has changed, and never \
+    invent names, numbers, dates or commitments that aren't in the transcript. Speaker labels such \
+    as "Speaker 2" or "Others" are placeholders; use real names only when people are addressed or \
+    introduced by name. Return only the minutes, with no preamble.
+    """
+
+  static func systemPrompt(prompt: String, language: String, context: String) -> String {
+    var system = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    system += "\n\nWrite the minutes in \(language), whatever language the meeting is held in."
+    let context = context.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !context.isEmpty { system += "\n\n\(context)" }
+    return system
   }
 
-  static func requestText(previousMinutes: String?, final: Bool) -> String {
-    let previous = previousMinutes.map { "Current minutes:\n\n\($0)" } ?? "There are no minutes yet."
-    let ask = final
-      ? "The meeting has ended and the transcript above is complete, with speakers identified. Write the final minutes."
-      : "Update the minutes to cover the transcript so far."
-    return "\(previous)\n\n\(ask)"
+  /// After the cached transcript: the current minutes, everything you changed in them during the
+  /// meeting, and whether the meeting is still running.
+  static func requestText(previousMinutes: String?, edits: [MinutesEdit], final: Bool) -> String {
+    var parts: [String] = []
+    if let previousMinutes {
+      parts.append((edits.isEmpty ? "Current minutes:" : "Current minutes, including the user's own edits:") + "\n\n" + previousMinutes)
+    } else {
+      parts.append("There are no minutes yet.")
+    }
+    if !edits.isEmpty {
+      var lines = ["The user has edited the minutes during this meeting (oldest first):"]
+      for (index, edit) in edits.enumerated() {
+        lines.append("Edit \(index + 1):")
+        lines += edit.removed.map { "Removed: \($0)" }
+        lines += edit.added.map { "Added: \($0)" }
+      }
+      lines.append("""
+        The user's edits take precedence over your own earlier versions. Keep what they added, in their \
+        wording, in the section where it belongs; enrich it with details from the transcript, and \
+        correct it only where the transcript clearly says otherwise. Apply their corrections \
+        throughout (a corrected name or term applies everywhere), and don't bring back what they \
+        removed unless the conversation returns to it later.
+        """)
+      parts.append(lines.joined(separator: "\n"))
+    }
+    parts.append(
+      final
+        ? "The meeting has ended and the transcript above is complete, with speakers identified. Write the final minutes."
+        : "The meeting is still going on, so don't treat the last topic as a conclusion. Update the minutes to cover the transcript so far.")
+    return parts.joined(separator: "\n\n")
+  }
+}
+
+/// One round of your changes to the minutes: the lines you removed and the lines you added.
+/// A changed line shows up as both, which is how the model sees a correction.
+struct MinutesEdit: Equatable {
+  let removed: [String]
+  let added: [String]
+
+  /// nil when nothing changed (moved lines don't count).
+  init?(from old: String, to new: String) {
+    func lines(_ text: String) -> [String] {
+      text.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+    let difference = lines(new).difference(from: lines(old))
+    var removed: [(offset: Int, line: String)] = []
+    var added: [String] = []
+    for change in difference {
+      switch change {
+      case .remove(let offset, let line, _): removed.append((offset, line))
+      case .insert(_, let line, _): added.append(line)
+      }
+    }
+    // Removals come last-first; list them in reading order.
+    let removedLines = removed.sorted { $0.offset < $1.offset }.map(\.line)
+    let moved = Set(removedLines).intersection(added)
+    self.removed = removedLines.filter { !moved.contains($0) }
+    self.added = added.filter { !moved.contains($0) }
+    if self.removed.isEmpty && self.added.isEmpty { return nil }
   }
 }
 
 /// Collects transcript lines during a meeting and refreshes the minutes on a timer.
+///
+/// Every update sends the whole transcript so far (cached by the provider) plus the current minutes.
+/// You can edit the minutes in between: your version becomes the current minutes, and the list of
+/// everything you changed goes with every later update and the final minutes, so the model builds
+/// on your text instead of overwriting it, and doesn't bring back what you deleted.
 @MainActor
 final class MinutesRunner {
   let config: MinutesConfig
@@ -409,6 +470,15 @@ final class MinutesRunner {
   private var inFlight = false
   private(set) var state: MinutesState
   private let publish: (MinutesState) -> Void
+
+  private var edits: [MinutesEdit] = []
+  private var editing = false
+  /// Bumped by each edit, so a response to a request sent before it isn't applied over it.
+  private var revision = 0
+  /// An update came due while you were editing.
+  private var deferred = false
+  /// A response that arrived while you were editing; used if you end up changing nothing.
+  private var held: String?
 
   init(config: MinutesConfig, publish: @escaping (MinutesState) -> Void) {
     self.config = config
@@ -448,6 +518,51 @@ final class MinutesRunner {
     Task { await update() }
   }
 
+  // MARK: Your edits
+
+  /// Updates wait until you're done, so nothing changes under your cursor.
+  func beginEditing() {
+    editing = true
+  }
+
+  func finishEditing(text: String) {
+    editing = false
+    if let edit = MinutesEdit(from: state.text, to: text) {
+      edits.append(edit)
+      revision += 1
+      held = nil
+      state.text = text
+      state.editsPending = true
+      publish(state)
+      Log.write("minutes edited: \(edit.removed.count) lines removed, \(edit.added.count) added")
+    } else {
+      applyHeld()
+    }
+    runIfDeferred()
+  }
+
+  func cancelEditing() {
+    editing = false
+    applyHeld()
+    runIfDeferred()
+  }
+
+  private func applyHeld() {
+    guard let held else { return }
+    self.held = nil
+    state.text = held
+    state.updatedAt = Date()
+    publish(state)
+  }
+
+  private func runIfDeferred() {
+    guard deferred else { return }
+    deferred = false
+    Task { await update() }
+  }
+
+  // MARK: Updating
+
   private func schedule() {
     state.nextUpdate = Date().addingTimeInterval(config.interval)
     publish(state)
@@ -455,37 +570,57 @@ final class MinutesRunner {
 
   private func update() async {
     schedule()
-    guard !inFlight, !pendingLines.isEmpty else { return }
-    let newText = pendingLines.joined(separator: "\n")
-    // Wait for a little substance before the first update.
-    if chunks.isEmpty, newText.count < 150 { return }
-    chunks.append(newText)
-    pendingLines = []
+    if editing {
+      deferred = true
+      return
+    }
+    guard !inFlight else { return }
+    if !pendingLines.isEmpty {
+      let newText = pendingLines.joined(separator: "\n")
+      // Wait for a little substance before the first update, unless you've already written something.
+      if chunks.isEmpty, newText.count < 150, !state.editsPending { return }
+      chunks.append(newText)
+      pendingLines = []
+    } else if !state.editsPending {
+      return
+    }
+    guard !chunks.isEmpty else { return }
+
     inFlight = true
     state.isUpdating = true
     publish(state)
-    defer {
-      inFlight = false
-      state.isUpdating = false
-      publish(state)
-    }
+    let sentRevision = revision
+    var rerun = false
     do {
       let result = try await client.minutes(
-        transcriptChunks: chunks, previousMinutes: state.text.isEmpty ? nil : state.text, config: config,
-        final: false, longCache: longCache)
-      state.text = result.text
-      state.updatedAt = Date()
-      state.error = nil
+        transcriptChunks: chunks, previousMinutes: state.text.isEmpty ? nil : state.text, edits: edits,
+        config: config, final: false, longCache: longCache)
       state.usage = state.usage + result.usage
       state.cost = state.usage.estimatedCost(model: config.model, longCache: longCache)
-      Log.write("minutes updated: \(chunks.count) chunks, usage in=\(result.usage.input) cached=\(result.usage.cacheRead) written=\(result.usage.cacheWrite) out=\(result.usage.output)")
+      state.error = nil
+      Log.write("minutes updated: \(chunks.count) chunks, \(edits.count) edits, usage in=\(result.usage.input) cached=\(result.usage.cacheRead) written=\(result.usage.cacheWrite) out=\(result.usage.output)")
+      if revision != sentRevision {
+        // You edited while this ran; redo it from your version.
+        rerun = true
+      } else if editing {
+        held = result.text
+      } else {
+        state.text = result.text
+        state.editsPending = false
+        state.updatedAt = Date()
+      }
     } catch {
       state.error = error.localizedDescription
       Log.write("minutes update failed: \(error)")
     }
+    inFlight = false
+    state.isUpdating = false
+    publish(state)
+    if rerun { await update() }
   }
 
-  /// Final minutes from the finished transcript (with speaker names), using the live minutes as a draft.
+  /// Final minutes from the finished transcript (with speaker names), using the live minutes as a
+  /// draft and keeping your edits.
   func finalize(transcript: String) async -> String? {
     stop()
     guard !transcript.isEmpty else { return nil }
@@ -497,14 +632,15 @@ final class MinutesRunner {
     }
     do {
       let result = try await client.minutes(
-        transcriptChunks: [transcript], previousMinutes: state.text.isEmpty ? nil : state.text, config: config,
-        final: true, longCache: false)
+        transcriptChunks: [transcript], previousMinutes: state.text.isEmpty ? nil : state.text, edits: edits,
+        config: config, final: true, longCache: false)
       state.text = result.text
+      state.editsPending = false
       state.updatedAt = Date()
       state.error = nil
       state.usage = state.usage + result.usage
       state.cost = state.usage.estimatedCost(model: config.model, longCache: longCache)
-      Log.write("final minutes written, usage in=\(result.usage.input) out=\(result.usage.output)")
+      Log.write("final minutes written, \(edits.count) edits, usage in=\(result.usage.input) out=\(result.usage.output)")
       return result.text
     } catch {
       state.error = "Final minutes failed: \(error.localizedDescription)"
@@ -512,11 +648,14 @@ final class MinutesRunner {
       return nil
     }
   }
-
 }
 
 struct MinutesState: Equatable {
   var text = ""
+  /// false when live minutes are off: the pane then holds only your own notes.
+  var usesAI = true
+  /// You changed the minutes and no update has worked the changes in yet.
+  var editsPending = false
   var updatedAt: Date?
   var nextUpdate: Date?
   var isUpdating = false
