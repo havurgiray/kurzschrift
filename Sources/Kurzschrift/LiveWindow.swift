@@ -147,7 +147,8 @@ struct LiveTranscriptView: View {
   }
 
   private func modeDescription(_ config: SessionConfig) -> String {
-    let spoken = AppSettings.languageName(config.spokenLocale.identifier)
+    var spoken = AppSettings.languageName(config.spokenLocale.identifier)
+    if let second = config.secondLocale { spoken += " + " + AppSettings.languageName(second.identifier) }
     if config.mode == .translate, let target = config.targetLanguage {
       return "Translating \(spoken) → \(AppSettings.languageName(target.minimalIdentifier))"
     }
@@ -336,9 +337,11 @@ private struct CaptionStrip: View {
       }
       ForEach(active, id: \.0) { source, partial in
         VStack(alignment: .leading, spacing: 2) {
-          if session.config?.includeMic == true {
-            Text(source == .microphone ? (session.config?.myName ?? "Me") : "Others")
-              .font(.caption).foregroundStyle(.secondary)
+          let who = session.config?.includeMic == true ? (source == .microphone ? (session.config?.myName ?? "Me") : "Others") : nil
+          let language = partial.language.map { AppSettings.languageName($0) }
+          let label = [who, language].compactMap { $0 }.joined(separator: " · ")
+          if !label.isEmpty {
+            Text(label).font(.caption).foregroundStyle(.secondary)
           }
           Text(partial.original)
             .font(.system(size: translating ? fontSize + 1 : fontSize + 5, weight: translating ? .regular : .medium))
@@ -374,7 +377,7 @@ private struct SidePane: View {
     VStack(spacing: 0) {
       if hasMinutes && canAsk {
         Picker("", selection: $tab) {
-          Text("Minutes").tag(0)
+          Text(session.minutes?.usesAI == false ? "Notes" : "Minutes").tag(0)
           Text("Ask").tag(1)
         }
         .pickerStyle(.segmented)
@@ -449,49 +452,95 @@ private struct MinutesPane: View {
   @ObservedObject var session: SessionController
   let fontSize: Double
 
+  private var editing: Bool { session.minutesDraft != nil }
+  /// Live minutes are off: only your own notes.
+  private var notesOnly: Bool { session.minutes?.usesAI == false }
+  /// Not while the final minutes are being written.
+  private var canEdit: Bool { session.isRecording || (session.isIdle && session.finished != nil) }
+
   var body: some View {
     let state = session.minutes
     VStack(spacing: 0) {
       HStack(spacing: 6) {
-        Text("Minutes").font(.headline)
+        Text(notesOnly ? "Notes" : "Minutes").font(.headline)
         if state?.isUpdating == true { ProgressView().controlSize(.small) }
         Spacer()
-        if session.isRecording {
-          Button("Update now") { session.updateMinutesNow() }
+        if editing {
+          Button("Cancel") { session.cancelEditingMinutes() }
             .controlSize(.small)
-            .disabled(state?.isUpdating == true)
+          Button("Done") { session.finishEditingMinutes() }
+            .controlSize(.small)
+            .keyboardShortcut(.return, modifiers: .command)
+        } else {
+          if session.isRecording && !notesOnly {
+            Button("Update now") { session.updateMinutesNow() }
+              .controlSize(.small)
+              .disabled(state?.isUpdating == true)
+          }
+          Button {
+            session.beginEditingMinutes()
+          } label: {
+            Image(systemName: "pencil")
+          }
+          .controlSize(.small)
+          .help("Edit the minutes or add your own notes")
+          .disabled(!canEdit)
+          RemindersButton(session: session, minutes: state?.text ?? "")
+          Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(state?.text ?? "", forType: .string)
+          } label: {
+            Image(systemName: "doc.on.doc")
+          }
+          .controlSize(.small)
+          .help(notesOnly ? "Copy notes" : "Copy minutes")
+          .disabled(state?.text.isEmpty ?? true)
         }
-        RemindersButton(session: session, minutes: state?.text ?? "")
-        Button {
-          NSPasteboard.general.clearContents()
-          NSPasteboard.general.setString(state?.text ?? "", forType: .string)
-        } label: {
-          Image(systemName: "doc.on.doc")
-        }
-        .controlSize(.small)
-        .help("Copy minutes")
-        .disabled(state?.text.isEmpty ?? true)
       }
       .padding(.horizontal, 12)
       .padding(.vertical, 8)
       Divider()
-      ScrollView {
-        VStack(alignment: .leading, spacing: 0) {
-          if let text = state?.text, !text.isEmpty {
-            MarkdownView(text: text, fontSize: fontSize - 1)
-          } else {
-            Text("The first minutes appear after the first update interval, once enough has been said.")
-              .foregroundStyle(.tertiary)
-          }
-        }
-        .textSelection(.enabled)
+      if editing {
+        TextEditor(text: Binding(get: { session.minutesDraft ?? "" }, set: { session.minutesDraft = $0 }))
+          .font(.system(size: fontSize - 1))
+          .scrollContentBackground(.hidden)
+          .padding(8)
+        Text(
+          notesOnly
+            ? "Your notes are saved with the transcript."
+            : session.isRecording
+              ? "Correct anything or add your own notes. The next update keeps your changes, fills them in from the transcript, and won't bring back what you delete. Updates wait while you edit."
+              : "Your changes go straight into the transcript file."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-      }
-      Divider()
-      MinutesStatusLine(state: state, recording: session.isRecording)
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.bottom, 8)
+      } else {
+        ScrollView {
+          VStack(alignment: .leading, spacing: 0) {
+            if let text = state?.text, !text.isEmpty {
+              MarkdownView(text: text, fontSize: fontSize - 1)
+            } else if notesOnly {
+              Text("Take notes with the pencil button; they're saved with the transcript. With an API key in Settings → Minutes, AI also writes minutes around your notes.")
+                .foregroundStyle(.tertiary)
+            } else {
+              Text("The first minutes appear after the first update interval, once enough has been said. You can also start them yourself with the pencil button.")
+                .foregroundStyle(.tertiary)
+            }
+          }
+          .textSelection(.enabled)
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(12)
+        }
+      }
+      if !notesOnly {
+        Divider()
+        MinutesStatusLine(state: state, recording: session.isRecording, editing: editing)
+          .padding(.horizontal, 12)
+          .padding(.vertical, 6)
+      }
     }
   }
 }
@@ -555,6 +604,7 @@ private struct RemindersButton: View {
 private struct MinutesStatusLine: View {
   let state: MinutesState?
   let recording: Bool
+  let editing: Bool
 
   var body: some View {
     TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -562,11 +612,15 @@ private struct MinutesStatusLine: View {
         if let error = state?.error {
           Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
           Text(error).lineLimit(2)
+        } else if recording && editing {
+          Text("Updates wait while you edit")
+        } else if recording && state?.editsPending == true {
+          Text("Your edits go into the next update")
         } else if let updated = state?.updatedAt {
           Text("Updated \(updated.formatted(date: .omitted, time: .shortened))")
         }
         Spacer()
-        if recording, let next = state?.nextUpdate, state?.isUpdating != true {
+        if recording, !editing, let next = state?.nextUpdate, state?.isUpdating != true {
           let seconds = max(0, Int(next.timeIntervalSince(context.date)))
           Text("next in \(seconds / 60):\(String(format: "%02d", seconds % 60))").monospacedDigit()
         }
