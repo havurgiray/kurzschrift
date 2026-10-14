@@ -1,9 +1,10 @@
 # Kurzschrift
 
-*Kurzschrift* is German for shorthand. It's a menu bar app for live meeting translation and transcription. It runs entirely
-on-device and has no subscription.
+*Kurzschrift* is German for shorthand. It's a free macOS menu bar app for live meeting translation
+and transcription. Speech recognition, translation and speaker separation run on your Mac; only the
+optional AI minutes and questions use an online API.
 
-| | Translate Meeting (use case 1) | Transcribe Meeting (use case 2) |
+| | Translate Meeting | Transcribe Meeting |
 |---|---|---|
 | Default language | German → English | English |
 | Listens to | Meeting audio (Teams, Zoom, browser…) | Meeting audio **and** your microphone |
@@ -12,6 +13,26 @@ on-device and has no subscription.
 | Speakers | Speaker 1…n | Your name + Speaker 1…n |
 
 Everything in the table can be changed in **Settings…**.
+
+## Requirements and installing
+
+- macOS 26 or later (it uses Apple's SpeechAnalyzer). Developed and tested on an Apple Silicon Mac.
+- The Xcode Command Line Tools (`xcode-select --install`), with Swift 6.2 or later.
+
+There is no prebuilt download. Build and install it from source:
+
+```bash
+git clone https://github.com/havurgiray/kurzschrift.git
+cd kurzschrift
+./build.sh                       # builds Kurzschrift.app and installs it into ~/Applications
+open ~/Applications/Kurzschrift.app
+```
+
+The speech-bubble icon appears in the menu bar. The first recording asks for the permissions
+described under [Permissions](#permissions).
+
+Recording other people may need their consent where you live. Let the people in your meetings know
+that you transcribe them.
 
 ## Using it
 
@@ -75,7 +96,7 @@ file.
 
 The prompt is shown in Settings → Minutes and can be edited (e.g. "focus on my action items"); **Reset to Default** brings back the built-in one.
 
-- **Privacy:** this is the only feature that sends anything off the Mac. The transcript text, not audio, goes to the provider you chose, and only while minutes are on.
+- **Privacy:** minutes and **Ask** are the only features that send anything off the Mac. The transcript text, not audio, goes to the provider you chose, and only while minutes are on or when you ask a question.
 - **Cost:** the transcript is sent so that everything already sent is read from the provider's prompt cache. The pane shows an estimate; with `claude-opus-5-5` a one-hour meeting at 3-minute updates costs around a dollar, and `claude-haiku-5-5` costs a few cents.
 - **Key storage:** keys are stored in `~/Library/Application Support/Kurzschrift/api-keys.json`, readable only by your user account. They're deliberately not in the keychain: the app is signed ad hoc, so the keychain would ask for your password after every rebuild.
 
@@ -124,7 +145,7 @@ uncompressed WAV) or turns keeping the recording off.
 - **Short meetings:** speaker detection needs a few minutes of each voice. On a 5-minute excerpt of the same meeting it merged two people into one.
 - **Undetected speech:** very quiet or very short speech that speaker detection misses is labeled "Unknown speaker".
 - **Recognition:** quality is that of Apple's recognizer. Names and jargon get misheard, and a sentence can come out as a statement when it was a question.
-- **One language per recording:** if people switch languages mid-meeting, that part comes out garbled.
+- **Languages:** each recording expects one spoken language plus, optionally, a second one (see [Getting names and languages right](#getting-names-and-languages-right)). Speech in any other language comes out garbled.
 
 ## Permissions
 
@@ -170,3 +191,12 @@ is built without its NeMo text-processing binary, so nothing is fetched from Git
   - `kurzschrift://snapshot?path=/tmp/window.png` (or `&window=subtitles`) draws the meeting window's or the subtitle bar's own view to a PNG.
   - `kurzschrift://window?size=small` (or `size=full`) switches the meeting window between the bar and the full window.
   - `defaults write local.kurzschrift minutesBaseURL.anthropic http://localhost:8765` (or `.openai`) points the minutes requests at a local mock server.
+
+## License
+
+Kurzschrift is free software: you can redistribute it and/or modify it under the terms of the
+[GNU Affero General Public License v3.0](LICENSE) as published by the Free Software Foundation.
+It comes with no warranty.
+
+The vendored packages in `Vendor/` keep their own licenses: audiotee is MIT, FluidAudio is
+Apache 2.0 (see [Vendor/README.md](Vendor/README.md)).
