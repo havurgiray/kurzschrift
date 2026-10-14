@@ -63,6 +63,9 @@ private struct GeneralSettings: View {
       }
       Section {
         Toggle("Show the live window when a meeting starts", isOn: $settings.showLiveWindow)
+        Toggle("Minimize it to a small bar", isOn: $settings.liveWindowSmall)
+        Text("The bar shows the clock, what's being said, and Bookmark and Stop. The arrows button in the window switches between the bar and the full window.")
+          .font(.caption).foregroundStyle(.secondary)
         Picker("Live update interval", selection: $settings.liveUpdateMilliseconds) {
           ForEach(AppSettings.liveUpdateChoices, id: \.self) { ms in
             Text(AppSettings.intervalName(ms)).tag(ms)

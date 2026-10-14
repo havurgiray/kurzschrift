@@ -76,6 +76,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           if let text = query("text") { session.minutesDraft = text }
           session.finishEditingMinutes()
         }
+      case "window":
+        // Developer hook: size=small or size=full.
+        if let size = query("size") { AppSettings.shared.liveWindowSmall = size == "small" }
+        LiveWindowController.shared.show()
       case "toggle":
         if session.isRecording { await session.stop() } else if let mode { await session.start(mode) }
       default: break
@@ -150,6 +154,11 @@ private struct MenuContent: View {
     Divider()
     Button("Show Live Window") { LiveWindowController.shared.show() }
       .keyboardShortcut("l")
+    Button(settings.liveWindowSmall ? "Expand Live Window" : "Minimize Live Window to a Bar") {
+      settings.liveWindowSmall.toggle()
+      LiveWindowController.shared.show()
+    }
+    .keyboardShortcut("m")
     if session.canExport {
       Menu("Export Transcript") {
         Button("Save as Markdown…") { session.exportWithSavePanel(.markdown) }

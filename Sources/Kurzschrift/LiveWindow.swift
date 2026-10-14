@@ -32,8 +32,49 @@ final class LiveWindowController {
       panel.setFrameAutosaveName("MeetingWindow")
       if panel.frame.origin == .zero { panel.center() }
       self.panel = panel
+      fit(animate: false)
     }
     panel?.orderFrontRegardless()
+  }
+
+  /// Sizes the window as the full window or the small bar, whichever the setting says. Each keeps
+  /// its own place: the bar goes back to the corner you left it in, the full window to its spot.
+  func fit(animate: Bool) {
+    guard let panel else { return }
+    let defaults = UserDefaults.standard
+    let small = AppSettings.shared.liveWindowSmall
+    let frameIsSmall = defaults.bool(forKey: "MeetingWindowIsSmall")
+    var frame = panel.frame
+    if small != frameIsSmall {
+      defaults.set(NSStringFromRect(frame), forKey: frameIsSmall ? "MeetingWindowSmallFrame" : "MeetingWindowFullFrame")
+      defaults.set(small, forKey: "MeetingWindowIsSmall")
+      if let saved = defaults.string(forKey: small ? "MeetingWindowSmallFrame" : "MeetingWindowFullFrame").map(NSRectFromString),
+        NSScreen.screens.contains(where: { $0.visibleFrame.intersects(saved) })
+      {
+        frame = saved
+      } else {
+        // The first time, it grows or shrinks from its top-left corner.
+        let size = small ? NSSize(width: min(frame.width, 620), height: frame.height) : NSSize(width: 880, height: 580)
+        frame = NSRect(x: frame.minX, y: frame.maxY - size.height, width: size.width, height: size.height)
+      }
+    }
+    if small {
+      let height = Self.barHeight(fontSize: AppSettings.shared.liveFontSize)
+      panel.contentMinSize = NSSize(width: 340, height: height)
+      panel.contentMaxSize = NSSize(width: 10_000, height: height)
+      let content = panel.contentRect(forFrameRect: frame)
+      frame = panel.frameRect(forContentRect: NSRect(x: content.minX, y: content.maxY - height, width: content.width, height: height))
+    } else {
+      panel.contentMinSize = NSSize(width: 360, height: 260)
+      panel.contentMaxSize = NSSize(width: 10_000, height: 10_000)
+    }
+    frame = panel.constrainFrameRect(frame, to: panel.screen)
+    if frame != panel.frame { panel.setFrame(frame, display: true, animate: animate) }
+  }
+
+  /// One line of original text and two of translation (or two of transcript), plus padding.
+  static func barHeight(fontSize: Double) -> CGFloat {
+    ((fontSize - 2) * 1.3 + fontSize * 1.3 * 2 + 18).rounded(.up)
   }
 
   /// Developer hook (kurzschrift://snapshot?path=…): draws this window's own view into a PNG.
@@ -55,6 +96,14 @@ struct LiveTranscriptView: View {
   private var showsSidePane: Bool { session.minutes != nil || session.canAsk }
 
   var body: some View {
+    if settings.liveWindowSmall {
+      SmallBar(session: session, settings: settings, translating: translating)
+    } else {
+      fullWindow
+    }
+  }
+
+  private var fullWindow: some View {
     VStack(spacing: 0) {
       header
       Divider()
@@ -125,22 +174,17 @@ struct LiveTranscriptView: View {
         .help("Export the transcript, translation and minutes as they are right now")
       }
       if session.isRecording {
-        Button {
-          session.addBookmark()
-        } label: {
-          Image(systemName: "star")
-        }
-        .help("Bookmark this moment (⌃⌥B)")
+        BookmarkButton(session: session)
         Button("Stop & Save") { Task { await session.stop() } }
       } else if session.isIdle {
-        Menu("Start") {
-          ForEach(MeetingMode.allCases) { mode in
-            Button(settings.menuTitle(for: mode)) { Task { await session.start(mode) } }
-          }
-        }
-        .fixedSize(horizontal: true, vertical: false)
-        .menuStyle(.button)
+        StartMenu(session: session, settings: settings)
       }
+      Button {
+        settings.liveWindowSmall = true
+      } label: {
+        Image(systemName: "arrow.down.right.and.arrow.up.left")
+      }
+      .help("Shrink to a small bar. Recording, transcript and minutes carry on.")
     }
     .padding(.horizontal, 12)
     .padding(.vertical, 8)
@@ -165,6 +209,158 @@ struct LiveTranscriptView: View {
     }
     .font(.callout)
     .padding(10)
+  }
+}
+
+private struct StartMenu: View {
+  @ObservedObject var session: SessionController
+  @ObservedObject var settings: AppSettings
+
+  var body: some View {
+    Menu("Start") {
+      ForEach(MeetingMode.allCases) { mode in
+        Button(settings.menuTitle(for: mode)) { Task { await session.start(mode) } }
+      }
+    }
+    .fixedSize(horizontal: true, vertical: false)
+    .menuStyle(.button)
+  }
+}
+
+private struct BookmarkButton: View {
+  @ObservedObject var session: SessionController
+
+  var body: some View {
+    Button {
+      session.addBookmark()
+    } label: {
+      Image(systemName: "star")
+    }
+    .help("Bookmark this moment (⌃⌥B)")
+  }
+}
+
+// MARK: - Small bar
+
+/// The window shrunk out of the way: the clock, what is being said right now, and the buttons you
+/// need mid-meeting. Transcript, minutes and the saved file keep going as in the full window.
+private struct SmallBar: View {
+  @ObservedObject var session: SessionController
+  @ObservedObject var settings: AppSettings
+  let translating: Bool
+
+  private var fontSize: Double { settings.liveFontSize }
+
+  var body: some View {
+    HStack(spacing: 10) {
+      status
+      caption
+        .frame(maxWidth: .infinity, alignment: .leading)
+      buttons
+    }
+    .padding(.horizontal, 12)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  /// The newest in-progress text, or the last finished line while nobody is mid-sentence.
+  private var current: (label: String?, original: String, translation: String?)? {
+    for source in AudioSourceKind.allCases {
+      guard let partial = session.livePartials[source], !partial.original.isEmpty else { continue }
+      let who = session.config?.includeMic == true ? (source == .microphone ? (session.config?.myName ?? "Me") : "Others") : nil
+      let language = partial.language.map { AppSettings.languageName($0) }
+      let label = [who, language].compactMap { $0 }.joined(separator: " · ")
+      return (label.isEmpty ? nil : label, partial.original, partial.translation)
+    }
+    if let last = session.entries.last(where: { !$0.isBookmark }) {
+      return (last.speaker, last.original, last.translation)
+    }
+    return nil
+  }
+
+  private var status: some View {
+    VStack(alignment: .leading, spacing: 2) {
+      switch session.phase {
+      case .idle:
+        Image(systemName: "circle").foregroundStyle(.secondary)
+      case .starting, .finishing:
+        ProgressView().controlSize(.small)
+      case .recording:
+        HStack(spacing: 4) {
+          Image(systemName: "record.circle.fill").foregroundStyle(.red)
+          Text(TranscriptDocument.clock(Double(session.elapsedSeconds))).monospacedDigit()
+          if let warning = session.warning {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(warning)
+          }
+        }
+        if let label = current?.label {
+          Text(label).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
+      }
+    }
+    .frame(maxWidth: 150, alignment: .leading)
+    .fixedSize(horizontal: true, vertical: false)
+  }
+
+  @ViewBuilder private var caption: some View {
+    if let seconds = session.autoStopIn {
+      Label("No speech: stopping in \(seconds) s", systemImage: "timer")
+        .foregroundStyle(.orange)
+        .monospacedDigit()
+    } else {
+      switch session.phase {
+      case .idle:
+        Text(session.lastTranscript.map { "Saved \($0.lastPathComponent)" } ?? "Not recording")
+          .foregroundStyle(.secondary)
+          .lineLimit(2)
+          .truncationMode(.middle)
+      case .starting(let message), .finishing(let message):
+        Text(message).foregroundStyle(.secondary)
+      case .recording:
+        if let current {
+          VStack(alignment: .leading, spacing: 2) {
+            if translating {
+              Text(current.original)
+                .font(.system(size: fontSize - 2))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.head)
+              Text(current.translation ?? "…")
+                .font(.system(size: fontSize, weight: .medium))
+                .lineLimit(2)
+                .truncationMode(.head)
+            } else {
+              Text(current.original)
+                .font(.system(size: fontSize, weight: .medium))
+                .lineLimit(2)
+                .truncationMode(.head)
+            }
+          }
+        } else {
+          Text("Listening…").foregroundStyle(.tertiary)
+        }
+      }
+    }
+  }
+
+  private var buttons: some View {
+    HStack(spacing: 6) {
+      if session.isRecording {
+        if session.autoStopIn != nil {
+          Button("Keep Recording") { session.keepRecording() }
+        }
+        BookmarkButton(session: session)
+        Button("Stop & Save") { Task { await session.stop() } }
+      } else if session.isIdle {
+        StartMenu(session: session, settings: settings)
+      }
+      Button {
+        settings.liveWindowSmall = false
+      } label: {
+        Image(systemName: "arrow.up.left.and.arrow.down.right")
+      }
+      .help("Show the full window: transcript, minutes and questions")
+    }
+    .fixedSize()
   }
 }
 

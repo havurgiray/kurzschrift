@@ -18,7 +18,19 @@ final class AppSettings: ObservableObject {
   @Published var saveFolder: String { didSet { defaults.set(saveFolder, forKey: "saveFolder") } }
   @Published var myName: String { didSet { defaults.set(myName, forKey: "myName") } }
   @Published var showLiveWindow: Bool { didSet { defaults.set(showLiveWindow, forKey: "showLiveWindow") } }
-  @Published var liveFontSize: Double { didSet { defaults.set(liveFontSize, forKey: "liveFontSize") } }
+  /// The meeting window shrunk to a small bar: clock, latest caption, Bookmark and Stop.
+  @Published var liveWindowSmall: Bool {
+    didSet {
+      defaults.set(liveWindowSmall, forKey: "liveWindowSmall")
+      LiveWindowController.shared.fit(animate: true)
+    }
+  }
+  @Published var liveFontSize: Double {
+    didSet {
+      defaults.set(liveFontSize, forKey: "liveFontSize")
+      LiveWindowController.shared.fit(animate: false)  // the small bar's height follows the text
+    }
+  }
   /// How often the in-progress translation line and the recording clock refresh.
   @Published var liveUpdateMilliseconds: Int { didSet { defaults.set(liveUpdateMilliseconds, forKey: "liveUpdateMilliseconds") } }
   static let liveUpdateChoices = [250, 500, 1000, 2000]
@@ -99,6 +111,7 @@ final class AppSettings: ObservableObject {
       "saveFolder": documents.appendingPathComponent("Meeting Transcripts").path,
       "myName": "Me",
       "showLiveWindow": true,
+      "liveWindowSmall": false,
       "liveFontSize": 15.0,
       "liveUpdateMilliseconds": 500,
       "keepAudio": true,
@@ -137,6 +150,7 @@ final class AppSettings: ObservableObject {
     saveFolder = d.string(forKey: "saveFolder")!
     myName = d.string(forKey: "myName")!
     showLiveWindow = d.bool(forKey: "showLiveWindow")
+    liveWindowSmall = d.bool(forKey: "liveWindowSmall")
     liveFontSize = d.double(forKey: "liveFontSize")
     liveUpdateMilliseconds = d.integer(forKey: "liveUpdateMilliseconds")
     keepAudio = d.bool(forKey: "keepAudio")
