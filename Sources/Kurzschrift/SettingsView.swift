@@ -48,6 +48,11 @@ private struct GeneralSettings: View {
           .font(.caption).foregroundStyle(.secondary)
       }
       Section {
+        Toggle("Improve the transcript with Parakeet", isOn: $settings.parakeet)
+        Text("About every 15 seconds, NVIDIA's Parakeet model goes over what was just said again, on this Mac, and its text replaces the first version in the transcript, the minutes and the file: fewer misheard words and whole sentences, in German and English. The live captions stay as they are. Downloads 470 MB the first time.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+      Section {
         LabeledContent("Vocabulary") {
           TextEditor(text: $settings.vocabulary)
             .font(.body)

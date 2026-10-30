@@ -129,6 +129,21 @@ final class SessionController: ObservableObject {
   /// Session times (seconds) the user marked with ⌃⌥B or the ⭐ button.
   private var bookmarks: [Double] = []
 
+  /// Parakeet re-recognition (Parakeet.swift): the model, each track's audio until it has been
+  /// redone, how far each track has been redone, and the stretch being redone right now.
+  private enum ParakeetState { case off, loading, ready, failed }
+  private var parakeetState = ParakeetState.off
+  private var parakeet: ParakeetRecognizer?
+  private var histories: [AudioSourceKind: AudioHistory] = [:]
+  private var refinedUntil: [AudioSourceKind: Double] = [:]
+  private var refining: [AudioSourceKind: Task<Void, Never>] = [:]
+  private var refinedIDs: Set<UUID> = []
+  /// Apple's lines for the minutes while Parakeet is loading: dropped once it's ready (its own lines
+  /// take their place), passed on if it can't be loaded.
+  private var heldMinutesLines: [String] = []
+  /// Changes with every meeting, so work finishing late can't touch the next one.
+  private var sessionID = UUID()
+
   // MARK: Start
 
   /// `testAudio` replays a recording instead of capturing system audio (no microphone), for testing.
@@ -198,6 +213,11 @@ final class SessionController: ObservableObject {
 
       phase = .starting("Starting audio…")
       let sources: [AudioSourceKind] = config.includeMic ? [.system, .microphone] : [.system]
+      sessionID = UUID()
+      if config.parakeet {
+        for source in sources { histories[source] = AudioHistory() }
+        loadParakeet()
+      }
       for source in sources {
         let pipeline = try await SpeechPipeline.make(source: source, locale: locale, vocabulary: config.vocabulary)
         pipeline.start { [weak self] event in await self?.handle(event) }
@@ -217,11 +237,13 @@ final class SessionController: ObservableObject {
       for source in sources {
         let pipeline = pipelines[source]!
         let second = secondaryPipelines[source]
+        let history = histories[source]
         tracks[source] = try Track(
           kind: source, fileURL: folder.appendingPathComponent("\(source.rawValue).wav"), sessionStart: start
         ) { buffer in
           pipeline.append(buffer)
           second?.append(buffer)
+          history?.append(buffer)
         }
       }
       if let testAudio {
@@ -295,6 +317,16 @@ final class SessionController: ObservableObject {
     minutesRunner?.stop()
     let endedAt = Date()
     Log.write("speech finished: \(segments.count) segments")
+    if parakeetState == .ready {
+      phase = .finishing("Improving the transcript…")
+      for source in Array(histories.keys) {
+        await refining[source]?.value
+        refine(source, final: true)
+        await refining[source]?.value
+      }
+    } else if parakeetState == .loading {
+      Log.write("parakeet still loading at the end; the transcript stays as recognized live")
+    }
 
     var notes: [String] = []
     var speakers: [AudioSourceKind: [SpeakerSpan]] = [:]
@@ -400,6 +432,14 @@ final class SessionController: ObservableObject {
     translator = nil
     document = nil
     pendingPreview = [:]
+    sessionID = UUID()
+    parakeet = nil
+    parakeetState = .off
+    histories = [:]
+    refinedUntil = [:]
+    refining = [:]
+    refinedIDs = []
+    heldMinutesLines = []
     if let recordingFolder { try? FileManager.default.removeItem(at: recordingFolder) }
     recordingFolder = nil
   }
@@ -442,8 +482,25 @@ final class SessionController: ObservableObject {
     livePartials[segment.source] = nil
     repairPunctuation(&segment)
     guard !segment.text.isEmpty else { return }
+    // Apple's version of a stretch Parakeet has already redone arrives too late to matter.
+    if let until = refinedUntil[segment.source], (segment.start + segment.end) / 2 < until { return }
     Log.write("final \(segment.source) \(String(format: "%.1f-%.1f", segment.start, segment.end)): \(segment.text.count) chars")
     segments.append(segment)
+    let entry = await liveEntry(for: segment)
+    if insert(entry, for: segment) {
+      let line = Self.minutesLine(segment, speaker: entry.speaker)
+      switch parakeetState {
+      case .off, .failed: minutesRunner?.add(line: line)
+      case .loading: heldMinutesLines.append(line)
+      case .ready: break  // Parakeet's version of this stretch goes to the minutes
+      }
+    }
+    document?.writeDraft(entries: entries, minutes: minutes?.text)
+    refine(segment.source)
+  }
+
+  /// The transcript line for a finished segment: who (when both sources are on) and the translation.
+  private func liveEntry(for segment: FinalSegment) async -> LiveEntry {
     let speaker = config?.includeMic == true ? (segment.source == .microphone ? config?.myName : "Others") : nil
     var entry = LiveEntry(
       id: segment.id, source: segment.source, speaker: speaker, start: segment.start, original: segment.text)
@@ -454,10 +511,105 @@ final class SessionController: ObservableObject {
         entry.translation = await translator.translate(segment.text)
       }
     }
-    if insert(entry, for: segment) {
-      minutesRunner?.add(line: "[\(TranscriptDocument.clock(segment.start))] \(speaker ?? "Speaker"): \(segment.text)")
+    return entry
+  }
+
+  private static func minutesLine(_ segment: FinalSegment, speaker: String?) -> String {
+    "[\(TranscriptDocument.clock(segment.start))] \(speaker ?? "Speaker"): \(segment.text)"
+  }
+
+  // MARK: Parakeet
+
+  private func loadParakeet() {
+    parakeetState = .loading
+    let id = sessionID
+    Task {
+      do {
+        let started = Date()
+        let recognizer = try await ParakeetRecognizer.load()
+        guard id == sessionID else { return }
+        parakeet = recognizer
+        parakeetState = .ready
+        heldMinutesLines = []
+        Log.write("parakeet ready after \(Int(Date().timeIntervalSince(started))) s")
+        for source in Array(histories.keys) { refine(source) }
+      } catch {
+        guard id == sessionID else { return }
+        parakeetState = .failed
+        for history in histories.values { history.disable() }
+        for line in heldMinutesLines { minutesRunner?.add(line: line) }
+        heldMinutesLines = []
+        Log.write("parakeet unavailable: \(error)")
+      }
+    }
+  }
+
+  /// Hands the next stretch of a track to Parakeet once Apple has finished 15 s of it (the length
+  /// at which Parakeet is as accurate as on a whole recording), cut at the end of a sentence. With
+  /// `final`, the rest of the track after the meeting.
+  private func refine(_ source: AudioSourceKind, final: Bool = false) {
+    guard parakeetState == .ready, refining[source] == nil, let parakeet, let history = histories[source] else { return }
+    let from = refinedUntil[source] ?? 0
+    var to = history.duration
+    if !final {
+      guard let lastEnd = segments.filter({ $0.source == source && !refinedIDs.contains($0.id) }).map(\.end).max(),
+        lastEnd - from >= 15
+      else { return }
+      to = min(lastEnd + 0.2, to)
+    }
+    guard to - from >= 0.5 else { return }
+    let samples = history.samples(from: from, to: to)
+    let id = sessionID
+    refining[source] = Task {
+      do {
+        let words = try await parakeet.recognize(samples, offset: from)
+        guard id == sessionID else { return }
+        await replaceWithRefined(words, source: source, from: from, to: to)
+      } catch {
+        guard id == sessionID else { return }
+        // Keep Apple's lines for this stretch, and let the minutes have them after all.
+        Log.write("parakeet failed for \(source) \(Int(from))-\(Int(to)) s: \(error)")
+        refinedUntil[source] = to
+        for segment in segments
+        where segment.source == source && !refinedIDs.contains(segment.id) && (segment.start + segment.end) / 2 < to {
+          refinedIDs.insert(segment.id)
+          if entries.contains(where: { $0.id == segment.id }) {
+            minutesRunner?.add(line: Self.minutesLine(segment, speaker: entries.first { $0.id == segment.id }?.speaker))
+          }
+        }
+      }
+      history.discard(before: to)
+      refining[source] = nil
+      if !final { refine(source) }
+    }
+  }
+
+  /// Swaps Apple's lines up to `to` for Parakeet's sentences, in the window, the draft file and the minutes.
+  private func replaceWithRefined(_ words: [TimedWord], source: AudioSourceKind, from: Double, to: Double) async {
+    refinedUntil[source] = to
+    let replaced = segments.filter {
+      $0.source == source && !refinedIDs.contains($0.id) && ($0.start + $0.end) / 2 < to
+    }
+    let ids = Set(replaced.map(\.id))
+    segments.removeAll { ids.contains($0.id) }
+    entries.removeAll { ids.contains($0.id) }
+    let spoken = config?.spokenLocale.identifier ?? ""
+    let languages = [spoken] + [config?.secondLocale?.identifier, config?.targetLanguage?.minimalIdentifier].compactMap { $0 }
+    let refined = ParakeetRecognizer.segments(words, source: source, languages: languages) { start, end in
+      // The language Apple heard there, from the line overlapping it most.
+      func overlap(_ s: FinalSegment) -> Double { max(0, min(end, s.end) - max(start, s.start)) }
+      return replaced.max { overlap($0) < overlap($1) }.map { overlap($0) > 0 ? $0.locale : spoken } ?? spoken
+    }
+    for segment in refined {
+      refinedIDs.insert(segment.id)
+      segments.append(segment)
+      let entry = await liveEntry(for: segment)
+      if insert(entry, for: segment) {
+        minutesRunner?.add(line: Self.minutesLine(segment, speaker: entry.speaker))
+      }
     }
     document?.writeDraft(entries: entries, minutes: minutes?.text)
+    Log.write("parakeet \(source) \(Int(from))-\(Int(to)) s: \(replaced.count) lines became \(refined.count)")
   }
 
   /// Returns false when the line was dropped as loudspeaker echo.

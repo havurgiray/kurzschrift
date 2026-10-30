@@ -1,11 +1,12 @@
 import AVFoundation
+import FluidAudio
 import Foundation
 
 /// Rebuilds a transcript from kept recordings (.m4a or .wav), without the menu bar app or any permissions:
 ///
 ///     Kurzschrift --reprocess --mode transcribe|translate --system "meeting audio.m4a" \
 ///         [--mic "microphone.m4a"] [--out folder] [--language de-DE] [--also en-US|none]
-///         [--start 2026-09-30T10:20:00+02:00] [--verbose]
+///         [--start 2026-09-30T10:20:00+02:00] [--verbose] [--no-parakeet]
 ///
 /// For tuning language decisions: `--save-segments raw.json` keeps every recognizer's results
 /// before the decision, and `--load-segments raw.json` reuses them instead of recognizing again.
@@ -123,6 +124,28 @@ enum Reprocess {
       segments = decided.sorted { $0.start < $1.start }
       let kept = Dictionary(grouping: segments, by: \.locale).mapValues(\.count)
       FileHandle.standardError.write(Data("languages kept: \(kept)\n".utf8))
+    }
+    // The whole recording again with Parakeet (Parakeet.swift); Apple's lines only settle the
+    // language where a sentence is too short to tell.
+    if config.parakeet, !CommandLine.arguments.contains("--no-parakeet") {
+      do {
+        let recognizer = try await ParakeetRecognizer.load()
+        let languages = [locale.identifier] + [secondLocale?.identifier, config.targetLanguage?.minimalIdentifier].compactMap { $0 }
+        var redone: [FinalSegment] = []
+        for (source, url) in files {
+          let words = try await recognizer.recognize(try AudioConverter().resampleAudioFile(url), offset: 0)
+          let apple = segments.filter { $0.source == source }
+          redone += ParakeetRecognizer.segments(words, source: source, languages: languages) { start, end in
+            func overlap(_ s: FinalSegment) -> Double { max(0, min(end, s.end) - max(start, s.start)) }
+            return apple.max { overlap($0) < overlap($1) }.map { overlap($0) > 0 ? $0.locale : locale.identifier }
+              ?? locale.identifier
+          }
+        }
+        segments = redone.sorted { $0.start < $1.start }
+        FileHandle.standardError.write(Data("parakeet: \(segments.count) sentences\n".utf8))
+      } catch {
+        FileHandle.standardError.write(Data("parakeet unavailable, keeping Apple's transcript: \(error)\n".utf8))
+      }
     }
     if CommandLine.arguments.contains("--verbose") {
       let system = segments.filter { $0.source == .system }

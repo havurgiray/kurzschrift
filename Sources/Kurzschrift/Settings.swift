@@ -35,6 +35,8 @@ final class AppSettings: ObservableObject {
   @Published var liveUpdateMilliseconds: Int { didSet { defaults.set(liveUpdateMilliseconds, forKey: "liveUpdateMilliseconds") } }
   static let liveUpdateChoices = [250, 500, 1000, 2000]
   @Published var keepAudio: Bool { didSet { defaults.set(keepAudio, forKey: "keepAudio") } }
+  /// Re-recognize the finished transcript with NVIDIA Parakeet (see Parakeet.swift).
+  @Published var parakeet: Bool { didSet { defaults.set(parakeet, forKey: "parakeet") } }
   /// AAC bit rate of the kept recording in kbps; 0 keeps the uncompressed WAV.
   @Published var audioBitrate: Int { didSet { defaults.set(audioBitrate, forKey: "audioBitrate") } }
   /// What Apple's AAC encoder accepts for 16 kHz mono, plus 0 for WAV.
@@ -120,6 +122,7 @@ final class AppSettings: ObservableObject {
       "liveFontSize": 15.0,
       "liveUpdateMilliseconds": 500,
       "keepAudio": true,
+      "parakeet": true,
       "audioBitrate": 32,
       "vocabulary": "",
       "autoStopMinutes": 10,
@@ -159,6 +162,7 @@ final class AppSettings: ObservableObject {
     liveFontSize = d.double(forKey: "liveFontSize")
     liveUpdateMilliseconds = d.integer(forKey: "liveUpdateMilliseconds")
     keepAudio = d.bool(forKey: "keepAudio")
+    parakeet = d.bool(forKey: "parakeet")
     audioBitrate = d.integer(forKey: "audioBitrate")
     vocabulary = d.string(forKey: "vocabulary")!
     autoStopMinutes = d.integer(forKey: "autoStopMinutes")
@@ -246,6 +250,7 @@ final class AppSettings: ObservableObject {
   func snapshot(for mode: MeetingMode) -> SessionConfig {
     var config = baseSnapshot(for: mode)
     config.vocabulary = vocabularyTerms
+    config.parakeet = parakeet
     let also = mode == .translate ? translateAlsoLocale : transcribeAlsoLocale
     config.secondLocale = also.isEmpty ? nil : Locale(identifier: also)
     return config
@@ -329,6 +334,8 @@ struct SessionConfig {
   var saveFolder: URL
   var keepAudio: Bool
   var audioBitrate = 32
+  /// Re-recognize the transcript with Parakeet.
+  var parakeet = false
   let layout: TranscriptLayout
   var minutes: MinutesConfig?
   var vocabulary: [String] = []
