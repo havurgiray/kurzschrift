@@ -686,6 +686,10 @@ final class SessionController: ObservableObject {
     minutesRunner?.updateNow()
   }
 
+  func minutesIntervalChanged() {
+    minutesRunner?.setInterval(TimeInterval(max(1, AppSettings.shared.minutesIntervalMinutes) * 60))
+  }
+
   func beginEditingMinutes() {
     guard let minutes, minutesDraft == nil else { return }
     minutesDraft = minutes.text

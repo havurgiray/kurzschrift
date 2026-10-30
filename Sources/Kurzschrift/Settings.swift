@@ -95,7 +95,12 @@ final class AppSettings: ObservableObject {
   @Published var minutesProvider: String { didSet { defaults.set(minutesProvider, forKey: "minutesProvider") } }
   @Published var minutesModelAnthropic: String { didSet { defaults.set(minutesModelAnthropic, forKey: "minutesModel.anthropic") } }
   @Published var minutesModelOpenAI: String { didSet { defaults.set(minutesModelOpenAI, forKey: "minutesModel.openai") } }
-  @Published var minutesIntervalMinutes: Int { didSet { defaults.set(minutesIntervalMinutes, forKey: "minutesIntervalMinutes") } }
+  @Published var minutesIntervalMinutes: Int {
+    didSet {
+      defaults.set(minutesIntervalMinutes, forKey: "minutesIntervalMinutes")
+      SessionController.shared.minutesIntervalChanged()  // also applies to a meeting in progress
+    }
+  }
   /// The minutes prompt; empty means the built-in default (so improvements to it still arrive).
   @Published var minutesPrompt: String { didSet { defaults.set(minutesPrompt, forKey: "minutesPrompt") } }
   static let minutesIntervalChoices = [1, 2, 3, 5, 10]

@@ -483,26 +483,39 @@ final class MinutesRunner {
   /// A response that arrived while you were editing; used if you end up changing nothing.
   private var held: String?
 
+  /// Seconds between updates; follows "Update every" in Settings, even mid-meeting.
+  private(set) var interval: TimeInterval
+
   init(config: MinutesConfig, publish: @escaping (MinutesState) -> Void) {
     self.config = config
     self.publish = publish
+    interval = config.interval
     client = MinutesClient(provider: config.provider, model: config.model, apiKey: config.apiKey)
     state = MinutesState(model: config.model, provider: config.provider)
   }
 
   /// Only the 5-minute cache stays warm between updates that start less than 5 minutes apart.
-  private var longCache: Bool { config.interval > 4 * 60 }
+  private var longCache: Bool { interval > 4 * 60 }
 
   func start() {
+    loop?.cancel()
     schedule()
     loop = Task { [weak self] in
       while !Task.isCancelled {
-        guard let interval = self?.config.interval else { return }
+        guard let interval = self?.interval else { return }
         try? await Task.sleep(for: .seconds(interval))
         if Task.isCancelled { return }
+        self?.schedule()
         await self?.update()
       }
     }
+  }
+
+  /// "Update every" changed during the meeting: the next update comes one new interval from now.
+  func setInterval(_ seconds: TimeInterval) {
+    guard seconds != interval else { return }
+    interval = seconds
+    if loop != nil { start() }
   }
 
   func stop() {
@@ -516,8 +529,9 @@ final class MinutesRunner {
     pendingLines.append(line)
   }
 
-  /// "Update now" in the minutes pane; the timer keeps its own rhythm.
+  /// "Update now" in the minutes pane. The next timed update comes a full interval after it.
   func updateNow() {
+    if loop != nil { start() }
     Task { await update() }
   }
 
@@ -567,12 +581,11 @@ final class MinutesRunner {
   // MARK: Updating
 
   private func schedule() {
-    state.nextUpdate = Date().addingTimeInterval(config.interval)
+    state.nextUpdate = Date().addingTimeInterval(interval)
     publish(state)
   }
 
   private func update() async {
-    schedule()
     if editing {
       deferred = true
       return
