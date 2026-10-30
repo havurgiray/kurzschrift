@@ -243,8 +243,17 @@ actor Translator {
     session = TranslationSession(installedSource: source, target: target)
   }
 
+  /// macOS sometimes reports a downloaded pair as not downloaded, and a moment later as downloaded
+  /// again. So it asks a few times, and in the end trusts a test translation over the status.
   static func isInstalled(from source: Locale.Language, to target: Locale.Language) async -> Bool {
-    await LanguageAvailability().status(from: source, to: target) == .installed
+    for attempt in 1...3 {
+      if await LanguageAvailability().status(from: source, to: target) == .installed { return true }
+      Log.write("translation \(source.minimalIdentifier)→\(target.minimalIdentifier) reported not downloaded (try \(attempt))")
+      if attempt < 3 { try? await Task.sleep(for: .seconds(1)) }
+    }
+    let works = (try? await TranslationSession(installedSource: source, target: target).translate("Hallo")) != nil
+    Log.write("translation test \(works ? "worked" : "failed")")
+    return works
   }
 
   func translate(_ text: String) async -> String? {
