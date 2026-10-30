@@ -134,18 +134,24 @@ enum Reprocess {
     }
 
     var speakers: [AudioSourceKind: [SpeakerSpan]] = [:]
+    var voices: [String: [Float]] = [:]
     var notes: [String] = []
     if config.separateSpeakers {
       for (source, url) in files where source == .system || config.micShared {
         do {
-          speakers[source] = try await Diarization.speakers(in: url).spans
+          let result = try await Diarization.speakers(in: url)
+          speakers[source] = result.spans
+          for (id, embedding) in result.voices { voices["\(source.rawValue):\(id)"] = embedding }
         } catch {
           notes.append("Speakers couldn't be identified: \(error.localizedDescription)")
         }
       }
     }
 
-    var turns = TranscriptBuilder.turns(segments: segments, speakers: speakers, config: config)
+    var turns = TranscriptBuilder.build(
+      segments: segments, speakers: speakers, config: config, knownNames: [:],
+      sameSpeakers: Diarization.sameVoices(voices)
+    ).turns
     if config.mode == .translate, let target = config.targetLanguage {
       // From the spoken language, or from the second one when the first is already the target.
       let from = ([locale] + (secondLocale.map { [$0] } ?? []))

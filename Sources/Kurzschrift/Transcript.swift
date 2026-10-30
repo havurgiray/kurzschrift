@@ -22,11 +22,12 @@ enum TranscriptBuilder {
     build(segments: segments, speakers: speakers, config: config, knownNames: [:]).turns
   }
 
-  /// `knownNames`: "source:speakerId" → a remembered person's name. Returns the turns and the name
-  /// each diarized speaker ended up with ("source:speakerId" → "Speaker 2" or "Maria").
+  /// `knownNames`: "source:speakerId" → a remembered person's name. `sameSpeakers`: microphone
+  /// speakers who are really someone in the meeting audio (`Diarization.sameVoices`). Returns the
+  /// turns and the name each diarized speaker ended up with ("source:speakerId" → "Speaker 2" or "Maria").
   static func build(
     segments: [FinalSegment], speakers: [AudioSourceKind: [SpeakerSpan]], config: SessionConfig,
-    knownNames: [String: String]
+    knownNames: [String: String], sameSpeakers: [String: String] = [:]
   ) -> (turns: [Turn], speakerNames: [String: String]) {
     let segments = removingEcho(segments.sorted { $0.start < $1.start })
     let bothSources = Set(segments.map(\.source)).count > 1 || config.includeMic
@@ -48,7 +49,8 @@ enum TranscriptBuilder {
       let labels = smooth(segment.words.map { speaker(at: max($0.start, $0.end - 0.1), in: spans) })
       var current: (label: String?, words: [TimedWord])?
       for (word, raw) in zip(segment.words, labels) {
-        let label = "\(segment.source.rawValue):\(raw ?? Self.unknownSpeaker)"
+        let own = "\(segment.source.rawValue):\(raw ?? Self.unknownSpeaker)"
+        let label = sameSpeakers[own] ?? own
         if let open = current, open.label == label {
           current!.words.append(word)
         } else {

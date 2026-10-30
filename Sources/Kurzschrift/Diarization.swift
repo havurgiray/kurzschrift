@@ -37,9 +37,60 @@ enum Diarization {
       try? FileManager.default.removeItem(at: output)
       try? FileManager.default.removeItem(at: voicesFile)
     }
-    let spans = mergingEdgeFragments(try JSONDecoder().decode([SpeakerSpan].self, from: Data(contentsOf: output)))
-    let voices = (try? JSONDecoder().decode([String: [Float]].self, from: Data(contentsOf: voicesFile))) ?? [:]
+    let raw = try JSONDecoder().decode([SpeakerSpan].self, from: Data(contentsOf: output))
+    let spans = foldingSnippetSpeakers(mergingEdgeFragments(raw))
+    let kept = Set(spans.map(\.speaker))
+    let voices = ((try? JSONDecoder().decode([String: [Float]].self, from: Data(contentsOf: voicesFile))) ?? [:])
+      .filter { kept.contains($0.key) }
     return Result(spans: spans, voices: voices)
+  }
+
+  /// A "speaker" who only ever speaks in snippets ("yeah", "mm", a laugh) and has a small share of
+  /// the talking is almost always someone else's reactions: a second or two of audio makes a poor
+  /// voice fingerprint, so the diarizer splits them off. In a 65-minute call with two remote people
+  /// that made four extra speakers. Their snippets go to the nearest real speaker in time.
+  /// Real participants talk for more than 8 s at least once: the quietest of the four people in
+  /// AMI ES2004a has 10% of the talking and turns of up to 18 s, and is kept.
+  static func foldingSnippetSpeakers(_ spans: [SpeakerSpan]) -> [SpeakerSpan] {
+    var total: [String: Double] = [:]
+    var longest: [String: Double] = [:]
+    for span in spans {
+      total[span.speaker, default: 0] += span.end - span.start
+      longest[span.speaker] = max(longest[span.speaker] ?? 0, span.end - span.start)
+    }
+    let speech = total.values.reduce(0, +)
+    let snippets = Set(total.keys.filter { longest[$0]! < 8 && total[$0]! < 0.1 * speech })
+    guard !snippets.isEmpty, snippets.count < total.count else { return spans }
+    let real = spans.filter { !snippets.contains($0.speaker) }
+    return spans.map { span in
+      guard snippets.contains(span.speaker) else { return span }
+      func gap(_ other: SpeakerSpan) -> Double { max(0, span.start - other.end, other.start - span.end) }
+      let nearest = real.min { gap($0) < gap($1) }!
+      return SpeakerSpan(speaker: nearest.speaker, start: span.start, end: span.end)
+    }
+  }
+
+  /// With loudspeakers the microphone hears the people in the call too, so diarizing it finds them
+  /// a second time (two of three microphone "speakers" in one meeting, at 0.89 and 0.93 similarity
+  /// to their meeting-audio selves). A microphone speaker whose voice matches someone in the
+  /// meeting audio, by the same measure as remembered voices, is that person.
+  /// Keys are "source:speakerId"; returns microphone label → meeting-audio label.
+  @MainActor
+  static func sameVoices(_ voices: [String: [Float]]) -> [String: String] {
+    func unit(_ v: [Float]) -> [Float] {
+      let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+      return norm > 0 ? v.map { $0 / norm } : v
+    }
+    let prefix = AudioSourceKind.system.rawValue + ":"
+    let meeting = voices.filter { $0.key.hasPrefix(prefix) }.mapValues(unit)
+    var result: [String: String] = [:]
+    for (label, voice) in voices where label.hasPrefix(AudioSourceKind.microphone.rawValue + ":") {
+      let v = unit(voice)
+      let best = meeting.map { (label: $0.key, score: zip(v, $0.value).reduce(0) { $0 + $1.0 * $1.1 }) }
+        .max { $0.score < $1.score }
+      if let best, best.score >= VoiceLibrary.threshold { result[label] = best.label }
+    }
+    return result
   }
 
   static func voicesURL(for spansFile: URL) -> URL {

@@ -317,9 +317,13 @@ final class SessionController: ObservableObject {
       }
     }
 
-    let known = AppSettings.shared.recognizeVoices ? VoiceLibrary.match(speakerVoices) : [:]
+    let sameSpeakers = Diarization.sameVoices(speakerVoices)
+    if !sameSpeakers.isEmpty { Log.write("\(sameSpeakers.count) microphone speaker(s) are people in the meeting audio") }
+    let known = AppSettings.shared.recognizeVoices
+      ? VoiceLibrary.match(speakerVoices.filter { sameSpeakers[$0.key] == nil }) : [:]
     if !known.isEmpty { Log.write("recognized \(known.count) known voice(s)") }
-    let built = TranscriptBuilder.build(segments: segments, speakers: speakers, config: config, knownNames: known)
+    let built = TranscriptBuilder.build(
+      segments: segments, speakers: speakers, config: config, knownNames: known, sameSpeakers: sameSpeakers)
     var turns = built.turns
     var voicesByName: [String: [Float]] = [:]
     for (label, name) in built.speakerNames { if let voice = speakerVoices[label] { voicesByName[name] = voice } }
@@ -509,7 +513,8 @@ final class SessionController: ObservableObject {
     let pattern = "\\b" + NSRegularExpression.escapedPattern(for: old) + "\\b"
     let template = NSRegularExpression.escapedTemplate(for: new)
     f.minutes = f.minutes?.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
-    if let voice = f.voices.removeValue(forKey: old) {
+    // Renaming onto a name already in this meeting merges the two; that person's voice stays.
+    if let voice = f.voices.removeValue(forKey: old), f.voices[new] == nil {
       f.voices[new] = voice
       if remember { VoiceLibrary.remember(new, embedding: voice) }
     }
