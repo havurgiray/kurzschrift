@@ -32,6 +32,8 @@ enum MinutesProvider: String, CaseIterable, Identifiable {
 
   /// Hidden override (`defaults write local.kurzschrift minutesBaseURL.<provider> …`) for testing
   /// against a local mock server.
+  var isOverridden: Bool { UserDefaults.standard.string(forKey: "minutesBaseURL.\(rawValue)") != nil }
+
   var baseURL: URL {
     if let override = UserDefaults.standard.string(forKey: "minutesBaseURL.\(rawValue)"),
       let url = URL(string: override)
@@ -332,6 +334,7 @@ final class MinutesClient: @unchecked Sendable {
     }
     let status = (response as? HTTPURLResponse)?.statusCode ?? 0
     let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+    if provider.isOverridden { Log.write("testing override: HTTP \(status) from \(request.url?.host ?? "?")") }
     guard (200..<300).contains(status) else {
       let message = ((json["error"] as? [String: Any])?["message"] as? String)
         ?? String(data: data.prefix(300), encoding: .utf8) ?? ""

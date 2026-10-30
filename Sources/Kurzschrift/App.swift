@@ -26,6 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       HotKeys.shared.apply(enabled: AppSettings.shared.globalShortcuts)
       CallDetector.shared.apply()
     }
+    for provider in MinutesProvider.allCases where provider.isOverridden {
+      Log.write("testing override: \(provider.rawValue) requests go to \(provider.baseURL.absoluteString)")
+    }
   }
 
   func applicationWillFinishLaunching(_ notification: Notification) {
