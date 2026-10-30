@@ -673,6 +673,18 @@ private struct MinutesPane: View {
               .controlSize(.small)
               .disabled(state?.isUpdating == true)
           }
+          if session.canStartAIMinutes {
+            Button {
+              session.startAIMinutes()
+            } label: {
+              Label("AI Minutes", systemImage: "sparkles")
+            }
+            .controlSize(.small)
+            .help(
+              session.isRecording
+                ? "Have AI write minutes from the transcript so far and keep them updated. Your notes are kept and worked in."
+                : "Have AI write minutes from the whole transcript. Your notes are kept and worked in.")
+          }
           Button {
             session.beginEditingMinutes()
           } label: {
@@ -705,7 +717,7 @@ private struct MinutesPane: View {
           notesOnly
             ? "Your notes are saved with the transcript."
             : session.isRecording
-              ? "Correct anything or add your own notes. The next update keeps your changes, fills them in from the transcript, and won't bring back what you delete. Updates wait while you edit."
+              ? "Correct anything or add your own notes. The next update works your changes in, tidied up and filled in from the transcript, and won't bring back what you delete. Updates wait while you edit."
               : "Your changes go straight into the transcript file."
         )
         .font(.caption)
@@ -718,8 +730,15 @@ private struct MinutesPane: View {
           VStack(alignment: .leading, spacing: 0) {
             if let text = state?.text, !text.isEmpty {
               MarkdownView(text: text, fontSize: fontSize - 1)
+            } else if notesOnly && session.canStartAIMinutes {
+              Text(
+                session.isRecording
+                  ? "Press AI Minutes to have minutes written from the transcript so far and updated every \(AppSettings.shared.minutesIntervalMinutes) min, or take your own notes with the pencil button."
+                  : "Press AI Minutes to have minutes written from the whole transcript, or take your own notes with the pencil button."
+              )
+              .foregroundStyle(.tertiary)
             } else if notesOnly {
-              Text("Take notes with the pencil button; they're saved with the transcript. With an API key in Settings → Minutes, AI also writes minutes around your notes.")
+              Text("Take notes with the pencil button; they're saved with the transcript. Add an API key in Settings → Minutes and an AI Minutes button appears here.")
                 .foregroundStyle(.tertiary)
             } else {
               Text("The first minutes appear after the first update interval, once enough has been said. You can also start them yourself with the pencil button.")

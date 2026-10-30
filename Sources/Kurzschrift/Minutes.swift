@@ -412,11 +412,12 @@ final class MinutesClient: @unchecked Sendable {
         lines += edit.added.map { "Added: \($0)" }
       }
       lines.append("""
-        The user's edits take precedence over your own earlier versions. Keep what they added, in their \
-        wording, in the section where it belongs; enrich it with details from the transcript, and \
-        correct it only where the transcript clearly says otherwise. Apply their corrections \
-        throughout (a corrected name or term applies everywhere), and don't bring back what they \
-        removed unless the conversation returns to it later.
+        The user's edits take precedence over your own earlier versions. Work what they added into the \
+        minutes, in the section where it belongs: keep its facts and intent, but tidy the wording to \
+        match the rest (complete shorthand, fix typos and misheard names) and fill it in with details \
+        from the transcript. Correct it only where the transcript clearly says otherwise. Apply their \
+        corrections throughout (a corrected name or term applies everywhere), and don't bring back \
+        what they removed unless the conversation returns to it later.
         """)
       parts.append(lines.joined(separator: "\n"))
     }

@@ -53,7 +53,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let audio = components.queryItems?.first { $0.name == "audio" }?.value.map { URL(fileURLWithPath: $0) }
         if let mode { await session.start(mode, testAudio: audio) }
       case "stop": await session.stop()
-      case "minutes": session.updateMinutesNow()
+      case "minutes":
+        if session.canStartAIMinutes { session.startAIMinutes() } else { session.updateMinutesNow() }
       case "bookmark": session.addBookmark()
       case "snapshot":
         if let path = query("path") {

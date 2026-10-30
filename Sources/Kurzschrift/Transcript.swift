@@ -219,8 +219,9 @@ final class TranscriptDocument {
 
   var baseName: String { url.deletingPathExtension().lastPathComponent }
 
-  /// AI minutes, or only your own notes when live minutes are off.
-  private var minutesHeading: String { config.minutes == nil ? "Notes" : "Minutes" }
+  /// AI minutes, or only your own notes; becomes true when AI minutes are switched on mid-meeting.
+  lazy var usesAIMinutes = config.minutes != nil
+  private var minutesHeading: String { usesAIMinutes ? "Minutes" : "Notes" }
 
   func writeDraft(entries: [SessionController.LiveEntry], minutes: String? = nil) {
     write(draftMarkdown(entries: entries, minutes: minutes))

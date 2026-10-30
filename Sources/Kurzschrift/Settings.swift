@@ -216,8 +216,10 @@ final class AppSettings: ObservableObject {
   }
 
   /// nil when minutes are off for this mode, or on but missing a key or model (`minutesProblem` says which).
-  func minutesConfig(for mode: MeetingMode) -> MinutesConfig? {
-    guard minutesEnabled(for: mode), let key = APIKeyStore.key(for: provider), !minutesModel.isEmpty else { return nil }
+  /// `evenIfOff` is for switching them on by hand during or after a meeting.
+  func minutesConfig(for mode: MeetingMode, evenIfOff: Bool = false) -> MinutesConfig? {
+    guard evenIfOff || minutesEnabled(for: mode), let key = APIKeyStore.key(for: provider), !minutesModel.isEmpty
+    else { return nil }
     let language = mode == .translate ? Self.languageName(translateTarget) : Self.languageName(transcribeLocale)
     let context = vocabularyTerms.isEmpty
       ? "" : "Names and terms that may come up (the transcript may misspell them): " + vocabularyTerms.joined(separator: ", ")

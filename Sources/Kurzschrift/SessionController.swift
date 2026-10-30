@@ -123,6 +123,8 @@ final class SessionController: ObservableObject {
   private var pendingPreview: [AudioSourceKind: String] = [:]
   private var previewGeneration: [AudioSourceKind: Int] = [:]
   private var minutesRunner: MinutesRunner?
+  /// The "minutes are on but there's no key" warning, cleared when AI minutes are switched on.
+  private var minutesWarning: String?
   private var lastSpeechAt = Date()
   /// Session times (seconds) the user marked with ⌃⌥B or the ⭐ button.
   private var bookmarks: [Double] = []
@@ -156,7 +158,8 @@ final class SessionController: ObservableObject {
     bookmarks = []
     questions = []
     finished = nil
-    warning = AppSettings.shared.minutesProblem(for: mode)
+    minutesWarning = AppSettings.shared.minutesProblem(for: mode)
+    warning = minutesWarning
     minutes = nil
     minutesDraft = nil
     phase = .starting("Preparing speech recognition…")
@@ -339,10 +342,7 @@ final class SessionController: ObservableObject {
     var finalMinutes: String?
     if let minutesRunner {
       phase = .finishing("Writing minutes…")
-      let lines = turns.map { (start: $0.start, line: "[\(TranscriptDocument.clock($0.start))] \($0.speaker ?? "Speaker"): \($0.text)") }
-        + bookmarks.map { (start: $0, line: Self.bookmarkLine($0)) }
-      let transcript = lines.sorted { $0.start < $1.start }.map(\.line).joined(separator: "\n")
-      finalMinutes = await minutesRunner.finalize(transcript: transcript)
+      finalMinutes = await minutesRunner.finalize(transcript: Self.minutesTranscript(turns: turns, bookmarks: bookmarks))
       if finalMinutes == nil, let live = minutes?.text, !live.isEmpty {
         finalMinutes = live
         notes.append("The final minutes couldn't be written (\(minutes?.error ?? "unknown error")); these are the last live minutes.")
@@ -688,6 +688,62 @@ final class SessionController: ObservableObject {
 
   func minutesIntervalChanged() {
     minutesRunner?.setInterval(TimeInterval(max(1, AppSettings.shared.minutesIntervalMinutes) * 60))
+  }
+
+  /// The pane holds only notes (there was no API key when the meeting started, or minutes are off
+  /// for this kind of meeting), and a key and model are set now.
+  var canStartAIMinutes: Bool {
+    minutes?.usesAI == false && canAsk && (isRecording || (isIdle && finished != nil))
+  }
+
+  /// "AI Minutes" in the notes pane. During the meeting: minutes from the transcript so far right
+  /// away, then at the usual interval. After it: final minutes from the finished transcript. Your
+  /// notes are handed over as your own edits, so they're worked in rather than replaced.
+  func startAIMinutes() {
+    let meetingConfig = isRecording ? config : finished?.config
+    guard canStartAIMinutes, let meetingConfig,
+      var minutesConfig = AppSettings.shared.minutesConfig(for: meetingConfig.mode, evenIfOff: true)
+    else { return }
+    if !meetingConfig.attendees.isEmpty {
+      minutesConfig = minutesConfig.adding(
+        context: "Attendees from the calendar invite: " + meetingConfig.attendees.joined(separator: ", "))
+    }
+    finishEditingMinutes()  // notes still being typed count too
+    let notes = minutes?.text ?? ""
+    let runner = MinutesRunner(config: minutesConfig) { [weak self] state in self?.minutesChanged(state) }
+    if !notes.isEmpty { runner.finishEditing(text: notes) }
+    minutes = runner.state
+    if warning == minutesWarning { warning = nil }
+    Log.write("AI minutes switched on \(isRecording ? "during" : "after") the meeting, notes: \(notes.isEmpty ? "none" : "yes")")
+
+    if isRecording {
+      config?.minutes = minutesConfig
+      document?.usesAIMinutes = true
+      for entry in entries {
+        runner.add(
+          line: entry.isBookmark
+            ? Self.bookmarkLine(entry.start)
+            : "[\(TranscriptDocument.clock(entry.start))] \(entry.speaker ?? "Speaker"): \(entry.original)")
+      }
+      minutesRunner = runner
+      runner.start()
+      runner.updateNow()
+    } else if let f = finished {
+      Task {
+        guard let text = await runner.finalize(transcript: Self.minutesTranscript(turns: f.turns, bookmarks: f.bookmarks))
+        else { return }  // the error shows in the pane; your notes stay as they were
+        f.document.usesAIMinutes = true
+        finished?.minutes = text
+        rewriteFinished()
+      }
+    }
+  }
+
+  /// The transcript as the minutes see it: one line per turn, with bookmarks in place.
+  private static func minutesTranscript(turns: [Turn], bookmarks: [Double]) -> String {
+    let lines = turns.map { (start: $0.start, line: "[\(TranscriptDocument.clock($0.start))] \($0.speaker ?? "Speaker"): \($0.text)") }
+      + bookmarks.map { (start: $0, line: bookmarkLine($0)) }
+    return lines.sorted { $0.start < $1.start }.map(\.line).joined(separator: "\n")
   }
 
   func beginEditingMinutes() {
