@@ -172,7 +172,8 @@ All of them stay on the Mac. Voices you name are stored in `~/Library/Applicatio
 ## Build
 
 ```bash
-./build.sh   # swift build (keychain disabled) → Kurzschrift.app → ~/Applications
+./build.sh     # swift build (keychain disabled) → Kurzschrift.app → ~/Applications
+./release.sh   # the same app zipped into dist/ for a GitHub release; installs nothing
 ```
 
 Needs only the Xcode Command Line Tools. Both dependencies are vendored under `Vendor/`, and FluidAudio

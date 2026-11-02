@@ -1,5 +1,7 @@
 #!/bin/bash
 # Builds Kurzschrift.app and installs it into ~/Applications.
+# With --no-install it stops at build/Kurzschrift.app and leaves the running app alone
+# (release.sh uses this).
 #
 # Signed ad hoc (no certificate, no keychain access). The catch: macOS treats every rebuild as a
 # new app, so it asks again for microphone and system-audio permission after each rebuild.
@@ -18,6 +20,7 @@ for bundle in .build/release/*.bundle; do
   [ -e "$bundle" ] && cp -R "$bundle" "$APP/Contents/Resources/"
 done
 codesign --force --deep --sign - "$APP"
+[ "${1:-}" = "--no-install" ] && exit 0
 
 INSTALLED="$HOME/Applications/Kurzschrift.app"
 mkdir -p "$HOME/Applications"
