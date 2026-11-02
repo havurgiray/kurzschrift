@@ -16,10 +16,15 @@ Everything in the table can be changed in **Settings…**.
 
 ## Requirements and installing
 
-- macOS 26 or later (it uses Apple's SpeechAnalyzer). Developed and tested on an Apple Silicon Mac.
-- The Xcode Command Line Tools (`xcode-select --install`), with Swift 6.2 or later.
+macOS 26 or later (it uses Apple's SpeechAnalyzer) on an Apple Silicon Mac.
 
-There is no prebuilt download. Build and install it from source:
+**Download:**
+
+1. Download `Kurzschrift-<version>.zip` from [Releases](https://github.com/havurgiray/kurzschrift/releases/latest), open it, and move **Kurzschrift.app** into Applications.
+2. Open it. macOS says it could not verify the app, because it isn't notarized by Apple (that needs a paid Apple developer account). Click **Done**.
+3. Open System Settings → Privacy & Security, scroll down to "Kurzschrift was blocked…", click **Open Anyway** and confirm with your password or Touch ID. You do this once for each new version.
+
+**Or build it from source** with the Xcode Command Line Tools (`xcode-select --install`, Swift 6.2 or later):
 
 ```bash
 git clone https://github.com/havurgiray/kurzschrift.git
@@ -156,7 +161,7 @@ uncompressed WAV) or turns keeping the recording off.
 
 The first recording asks for **System Audio Recording** and, when the microphone is included,
 **Microphone**. The app is signed ad hoc, without a certificate or keychain access, so **macOS asks
-again after every rebuild**. If a meeting produces nothing, check System Settings → Privacy & Security →
+again after every update or rebuild**. If a meeting produces nothing, check System Settings → Privacy & Security →
 Screen & System Audio Recording.
 
 Translation needs the languages downloaded: System Settings → General → Language & Region →
@@ -206,5 +211,11 @@ Kurzschrift is free software: you can redistribute it and/or modify it under the
 It comes with no warranty.
 
 The vendored packages in `Vendor/` keep their own licenses: audiotee is MIT, FluidAudio is
-Apache 2.0 (see [Vendor/README.md](Vendor/README.md)). The Parakeet model, downloaded at first use and
-not part of this repository, is NVIDIA's, under CC BY 4.0.
+Apache 2.0 (see [Vendor/README.md](Vendor/README.md)).
+
+Two sets of models are downloaded at first use and aren't part of this repository. Both are under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), and both are Fluid Inference's modified
+Core ML conversions:
+
+- Speech recognition: [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), converted in [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml).
+- Speaker separation: [pyannote speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1), with WeSpeaker speaker embeddings and PLDA parameters from BUT Speech@FIT, converted in [FluidInference/speaker-diarization-coreml](https://huggingface.co/FluidInference/speaker-diarization-coreml).
