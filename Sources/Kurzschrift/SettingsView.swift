@@ -97,6 +97,11 @@ private struct GeneralSettings: View {
       Section {
         Toggle("Launch at login", isOn: Binding(get: { settings.launchAtLogin }, set: { settings.launchAtLogin = $0 }))
       }
+      Section {
+        Toggle("Allow developer links", isOn: $settings.developerLinks)
+        Text("For testing Kurzschrift: kurzschrift:// links that replay an audio file as a meeting, save the meeting window as an image, edit the minutes or resize the window. Leave this off otherwise, since any web page can try to open these links. Start, stop, bookmark and the other links work either way.")
+          .font(.caption).foregroundStyle(.secondary)
+      }
     }
     .formStyle(.grouped)
   }

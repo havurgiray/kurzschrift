@@ -111,6 +111,10 @@ final class AppSettings: ObservableObject {
   @Published var micDeviceUID: String { didSet { defaults.set(micDeviceUID, forKey: "micDeviceUID") } }
   @Published var micShared: Bool { didSet { defaults.set(micShared, forKey: "micShared") } }
 
+  /// kurzschrift:// links meant for testing (start?audio=, snapshot, edit-minutes, window).
+  /// Off by default: any web page can try to open a kurzschrift:// link.
+  @Published var developerLinks: Bool { didSet { defaults.set(developerLinks, forKey: "developerLinks") } }
+
   private init() {
     let d = UserDefaults.standard
     let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -154,6 +158,7 @@ final class AppSettings: ObservableObject {
       "minutesPrompt": "",
       "micDeviceUID": "",
       "micShared": false,
+      "developerLinks": false,
     ])
     saveFolder = d.string(forKey: "saveFolder")!
     myName = d.string(forKey: "myName")!
@@ -194,6 +199,7 @@ final class AppSettings: ObservableObject {
     minutesPrompt = d.string(forKey: "minutesPrompt")!
     micDeviceUID = d.string(forKey: "micDeviceUID")!
     micShared = d.bool(forKey: "micShared")
+    developerLinks = d.bool(forKey: "developerLinks")
   }
 
   var launchAtLogin: Bool {

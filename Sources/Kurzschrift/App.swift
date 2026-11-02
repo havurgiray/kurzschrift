@@ -39,14 +39,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   /// kurzschrift://start?mode=translate|transcribe, kurzschrift://stop,
   /// kurzschrift://toggle?mode=... — for Shortcuts, Raycast, hotkey tools.
+  /// The developer links (start?audio=, snapshot, edit-minutes, window) only work while
+  /// Settings → General allows them, because any web page can try to open a kurzschrift:// link.
   @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
     guard let string = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
       let components = URLComponents(string: string), let action = components.host
     else { return }
     let mode = components.queryItems?.first { $0.name == "mode" }?.value.flatMap(MeetingMode.init(rawValue:))
     func query(_ name: String) -> String? { components.queryItems?.first { $0.name == name }?.value }
-    Log.write("url: \(string)")
+    let isDeveloperLink = ["snapshot", "edit-minutes", "window"].contains(action)
+      || (action == "start" && query("audio") != nil)
+    // Parameter names only: a question, a speaker's name or minutes text doesn't belong in the log.
+    Log.write("url: \(action) \((components.queryItems ?? []).map(\.name).joined(separator: ","))")
     Task { @MainActor in
+      guard !isDeveloperLink || AppSettings.shared.developerLinks else {
+        Log.write("url ignored: developer links are off (Settings → General)")
+        return
+      }
       let session = SessionController.shared
       switch action {
       case "start":
@@ -57,7 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if session.canStartAIMinutes { session.startAIMinutes() } else { session.updateMinutesNow() }
       case "bookmark": session.addBookmark()
       case "snapshot":
-        if let path = query("path") {
+        if let path = query("path"), path.lowercased().hasSuffix(".png") {
           if query("window") == "subtitles" {
             SubtitleController.shared.snapshot(to: path)
           } else {

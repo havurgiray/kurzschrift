@@ -190,10 +190,10 @@ is built without its NeMo text-processing binary, so nothing is fetched from Git
   ```
 
   `--language` and `--also` override the spoken languages, and `--start` sets the meeting's original start time for the file. With Parakeet on, the whole recording is redone with it at once (`--no-parakeet` keeps Apple's text).
-- Developer hooks:
+- Developer hooks. The links among them only work while Settings → General → **Allow developer links** is on. It's off by default, because any web page can try to open a kurzschrift:// link.
   - `kurzschrift://start?mode=translate&audio=/path/meeting.wav` replays a recording through the live pipeline instead of capturing audio, which needs no permissions.
   - `kurzschrift://edit-minutes?text=…` replaces the minutes as if you had edited them (`?step=begin` / `?step=cancel` hold and release an edit).
-  - `kurzschrift://snapshot?path=/tmp/window.png` (or `&window=subtitles`) draws the meeting window's or the subtitle bar's own view to a PNG.
+  - `kurzschrift://snapshot?path=/tmp/window.png` (or `&window=subtitles`) draws the meeting window's or the subtitle bar's own view to a PNG (the path has to end in `.png`).
   - `kurzschrift://window?size=small` (or `size=full`) switches the meeting window between the bar and the full window.
   - `Kurzschrift --parakeet "meeting audio.m4a" out.json [v2|v3]` transcribes a recording with NVIDIA Parakeet (downloads about 470 MB once) and writes the text with token timings, for comparing recognizers.
   - `defaults write local.kurzschrift minutesBaseURL.anthropic http://localhost:8765` (and `minutesBaseURL.openai`, so it doesn't matter which provider is chosen) points the minutes requests at a local mock server. While one is set, the log says so at launch and names the server each request went to.
