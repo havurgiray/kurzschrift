@@ -112,9 +112,7 @@ final class SpeechPipeline: @unchecked Sendable {
       modules: [transcriber], options: .init(priority: .userInitiated, modelRetention: .processLifetime))
     try await analyzer.prepareToAnalyze(in: format)
     if !vocabulary.isEmpty {
-      let context = AnalysisContext()
-      context.contextualStrings[.general] = vocabulary
-      try await analyzer.setContext(context)
+      try await analyzer.setContext(Self.analysisContext(vocabulary))
     }
     let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
     try await analyzer.start(inputSequence: stream)
@@ -189,6 +187,21 @@ final class SpeechPipeline: @unchecked Sendable {
   }
 
   /// Ends the input and waits until the last words have been finalized and delivered.
+  /// New names and terms mid-meeting (the Context tab); they apply to the audio from here on.
+  func setVocabulary(_ vocabulary: [String]) async {
+    do {
+      try await analyzer.setContext(Self.analysisContext(vocabulary))
+    } catch {
+      Log.write("\(source) recognizer: vocabulary not updated: \(error)")
+    }
+  }
+
+  private static func analysisContext(_ vocabulary: [String]) -> AnalysisContext {
+    let context = AnalysisContext()
+    context.contextualStrings[.general] = vocabulary
+    return context
+  }
+
   func finish() async {
     inputContinuation.finish()
     do {

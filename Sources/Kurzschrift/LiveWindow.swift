@@ -93,7 +93,7 @@ struct LiveTranscriptView: View {
   @ObservedObject var settings: AppSettings
 
   private var translating: Bool { session.config?.mode == .translate }
-  private var showsSidePane: Bool { session.minutes != nil || session.canAsk }
+  private var showsSidePane: Bool { session.minutes != nil || session.canAsk || !session.isIdle || session.finished != nil }
 
   var body: some View {
     if settings.liveWindowSmall {
@@ -482,9 +482,9 @@ private struct SpeakerLabel: View {
           Text("Rename “\(name)”").font(.headline)
           TextField("Name", text: $newName).textFieldStyle(.roundedBorder).onSubmit(apply)
           let used = Set(finished.turns.compactMap(\.speaker))
-          let suggestions = finished.config.attendees.filter { !used.contains($0) }
+          let suggestions = session.context.names.filter { !used.contains($0) }
           if !suggestions.isEmpty {
-            Text("From the calendar invite").font(.caption).foregroundStyle(.secondary)
+            Text("Participants").font(.caption).foregroundStyle(.secondary)
             ForEach(suggestions.prefix(8), id: \.self) { suggestion in
               Button(suggestion) { newName = suggestion }.buttonStyle(.link)
             }
@@ -565,28 +565,116 @@ private struct CaptionStrip: View {
 private struct SidePane: View {
   @ObservedObject var session: SessionController
   let fontSize: Double
-  @State private var tab = 0
+  /// Kept across launches, so the window opens on the tab you used last.
+  @AppStorage("liveSideTab") private var tab = Tab.minutes
+
+  enum Tab: String { case minutes, ask, context }
 
   var body: some View {
-    let hasMinutes = session.minutes != nil
-    let canAsk = session.canAsk || !session.questions.isEmpty
-    VStack(spacing: 0) {
-      if hasMinutes && canAsk {
-        Picker("", selection: $tab) {
-          Text(session.minutes?.usesAI == false ? "Notes" : "Minutes").tag(0)
-          Text("Ask").tag(1)
+    var tabs: [Tab] = []
+    if session.minutes != nil { tabs.append(.minutes) }
+    if session.canAsk || !session.questions.isEmpty { tabs.append(.ask) }
+    if !session.isIdle || session.finished != nil { tabs.append(.context) }
+    let shown = tabs.contains(tab) ? tab : tabs.first ?? .ask
+    return VStack(spacing: 0) {
+      if tabs.count > 1 {
+        Picker("", selection: Binding(get: { shown }, set: { tab = $0 })) {
+          ForEach(tabs, id: \.self) { tab in
+            switch tab {
+            case .minutes: Text(session.minutes?.usesAI == false ? "Notes" : "Minutes").tag(tab)
+            case .ask: Text("Ask").tag(tab)
+            case .context: Text("Context").tag(tab)
+            }
+          }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
         .padding(8)
         Divider()
       }
-      if hasMinutes && (tab == 0 || !canAsk) {
-        MinutesPane(session: session, fontSize: fontSize)
-      } else {
-        AskPane(session: session, fontSize: fontSize)
+      switch shown {
+      case .minutes: MinutesPane(session: session, fontSize: fontSize)
+      case .ask: AskPane(session: session, fontSize: fontSize)
+      case .context: ContextPane(session: session, fontSize: fontSize)
       }
     }
+  }
+}
+
+/// Who's in the meeting and what it's about. The minutes, your questions and speech recognition
+/// use it, and it's saved with the transcript.
+private struct ContextPane: View {
+  @ObservedObject var session: SessionController
+  let fontSize: Double
+
+  private var finishing: Bool {
+    if case .finishing = session.phase { return true }
+    return false
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 6) {
+        Text("Context").font(.headline)
+        Spacer()
+        if session.canRedoMinutes {
+          Button {
+            session.redoMinutes()
+          } label: {
+            Label("Redo Minutes", systemImage: "arrow.clockwise")
+          }
+          .controlSize(.small)
+          .help("Write the minutes again from the whole transcript, with this context")
+        }
+      }
+      .padding(.horizontal, 12)
+      .padding(.vertical, 8)
+      Divider()
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Participants").font(.subheadline.weight(.semibold))
+        field(
+          $session.context.participants,
+          placeholder: "One per line, with a role if it helps:\nMaria Huber – project lead\nJonas Berger – IT")
+        Text("About the meeting").font(.subheadline.weight(.semibold)).padding(.top, 6)
+        field($session.context.about, placeholder: "Topic, agenda, background, abbreviations…")
+        Text(footnote)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+          .padding(.top, 2)
+      }
+      .padding(12)
+      .disabled(finishing)
+    }
+  }
+
+  private func field(_ text: Binding<String>, placeholder: String) -> some View {
+    TextEditor(text: text)
+      .font(.system(size: fontSize - 1))
+      .scrollContentBackground(.hidden)
+      .padding(4)
+      .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+      .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator))
+      .overlay(alignment: .topLeading) {
+        if text.wrappedValue.isEmpty {
+          Text(placeholder)
+            .font(.system(size: fontSize - 1))
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .allowsHitTesting(false)
+        }
+      }
+      .frame(minHeight: 70, maxHeight: .infinity)
+  }
+
+  private var footnote: String {
+    if !session.isIdle {
+      return "The minutes and your questions use this from their next update, and speech recognition listens for the names. It's saved with the transcript."
+    }
+    return session.minutes?.usesAI == true
+      ? "Saved with the transcript and used for your questions. After a change, Redo Minutes writes the minutes again with it."
+      : "Saved with the transcript and used for your questions."
   }
 }
 
@@ -741,8 +829,11 @@ private struct MinutesPane: View {
               Text("Take notes with the pencil button; they're saved with the transcript. Add an API key in Settings → Minutes and an AI Minutes button appears here.")
                 .foregroundStyle(.tertiary)
             } else {
-              Text("The first minutes appear after the first update interval, once enough has been said. You can also start them yourself with the pencil button.")
-                .foregroundStyle(.tertiary)
+              Text(
+                "The first minutes appear after the first update interval, once enough has been said. You can also start them yourself with the pencil button."
+                  + (session.context.isEmpty ? " Under Context, say who's in the meeting and what it's about, and the minutes use it." : "")
+              )
+              .foregroundStyle(.tertiary)
             }
           }
           .textSelection(.enabled)

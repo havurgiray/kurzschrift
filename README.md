@@ -61,7 +61,7 @@ transcribing, and ⌃⌥B adds a bookmark.
 
 - When Teams, Zoom, Webex, FaceTime, Slack or Discord starts using the microphone, a notification offers **Translate** or **Transcribe**. When the call ends, the recording stops and saves.
 - A recording nobody has spoken in for 10 minutes stops and saves by itself. The window counts down the last minute and has a **Keep Recording** button.
-- If a calendar event is happening, the file is named after it and the attendee list goes into the front matter and the minutes.
+- If a calendar event is happening, the file is named after it, and its attendees go into the front matter and fill in the participants under **Context** (below).
 
 ### The meeting window
 
@@ -71,6 +71,7 @@ A floating window that stays on top, even over full-screen Teams:
 - **Transcript** (left): the whole meeting so far. For translations, the original is in grey above the English. It follows new lines; scroll up to read back and it stays put until you press **Jump to latest**.
 - **Minutes** (right, when live minutes are on): updated at the interval you choose, with **Update now**, a copy button, the time of the next update and the estimated API cost. The checklist button adds the action items to Apple Reminders; you pick which, and due dates like "by Friday" are recognized.
 - **Ask** (right, with an API key): questions about the meeting so far ("what did they decide about the budget?"), answered from the transcript with timestamps. Questions and answers are saved in the file.
+- **Context** (right): who's in the meeting, one per line with a role if it helps ("Maria Huber – project lead"), and what it's about (topic, agenda, background, abbreviations). It starts with the calendar invite's attendees. The minutes and your answers use it, speech recognition listens for the names, renaming a speaker offers them, and it's saved at the top of the file. After the meeting, **Redo Minutes** writes the minutes again once you've changed it.
 - **Speaker names**: after the meeting, click "Speaker 2" to rename them everywhere, in the window, the file and the minutes. Renaming a speaker to a name already in the meeting merges the two. With **Remember this voice** on, that person is named automatically in later meetings. Remembered voices are listed in Settings → General → Speakers.
 - **Export** (header): save as Markdown or text, or copy to the clipboard. Includes the transcript, translation and current minutes.
 - **Minimize** (the inward arrows, top right): shrinks the window to a small bar with the clock, the language being recognized, the latest caption (and its translation), **Bookmark** and **Stop & Save**. Recording, the transcript and the minutes carry on as before. The outward arrows bring back the full window. The bar and the full window each remember their own position and size, and the choice is kept for the next meeting (also in Settings → General).
@@ -124,7 +125,8 @@ open "kurzschrift://start?mode=translate"
 open "kurzschrift://start?mode=transcribe"
 open "kurzschrift://stop"
 open "kurzschrift://toggle?mode=translate"
-open "kurzschrift://minutes"     # update the minutes now (switches AI minutes on in a notes-only meeting)
+open "kurzschrift://minutes"     # update the minutes now (switches AI minutes on in a notes-only meeting;
+                                 # after a meeting, redoes them once you've changed the context)
 open "kurzschrift://bookmark"
 open "kurzschrift://ask?q=What%20did%20we%20decide%3F"
 open "kurzschrift://rename?from=Speaker%202&to=Maria"   # after a meeting; &remember=no to skip the voice
@@ -200,7 +202,8 @@ is built without its NeMo text-processing binary, so nothing is fetched from Git
   - `kurzschrift://start?mode=translate&audio=/path/meeting.wav` replays a recording through the live pipeline instead of capturing audio, which needs no permissions.
   - `kurzschrift://edit-minutes?text=…` replaces the minutes as if you had edited them (`?step=begin` / `?step=cancel` hold and release an edit).
   - `kurzschrift://snapshot?path=/tmp/window.png` (or `&window=subtitles`) draws the meeting window's or the subtitle bar's own view to a PNG (the path has to end in `.png`).
-  - `kurzschrift://window?size=small` (or `size=full`) switches the meeting window between the bar and the full window.
+  - `kurzschrift://window?size=small` (or `size=full`) switches the meeting window between the bar and the full window; `tab=minutes`, `ask` or `context` picks the tab on the right.
+  - `kurzschrift://context?participants=…&about=…` fills in the Context tab (a parameter left out keeps its text).
   - `Kurzschrift --parakeet "meeting audio.m4a" out.json [v2|v3]` transcribes a recording with NVIDIA Parakeet (downloads about 470 MB once) and writes the text with token timings, for comparing recognizers.
   - `defaults write local.kurzschrift minutesBaseURL.anthropic http://localhost:8765` (and `minutesBaseURL.openai`, so it doesn't matter which provider is chosen) points the minutes requests at a local mock server. While one is set, the log says so at launch and names the server each request went to.
 

@@ -103,6 +103,12 @@ final class SessionController: ObservableObject {
   @Published private(set) var autoStopIn: Int?
   @Published private(set) var questions: [QAItem] = []
   @Published private(set) var finished: FinishedMeeting?
+  /// The Context tab: who's in the meeting and what it's about. Applied a second after you stop typing.
+  @Published var context = MeetingContext() {
+    didSet { if context != oldValue { contextChanged() } }
+  }
+  /// The context the finished meeting's minutes were written with, so they can be redone after a change.
+  @Published private(set) var minutesContext: MeetingContext?
 
   var isIdle: Bool { phase == .idle }
   var isRecording: Bool { phase == .recording }
@@ -123,6 +129,9 @@ final class SessionController: ObservableObject {
   private var pendingPreview: [AudioSourceKind: String] = [:]
   private var previewGeneration: [AudioSourceKind: Int] = [:]
   private var minutesRunner: MinutesRunner?
+  private var contextTask: Task<Void, Never>?
+  /// The context's names the recognizers have been given.
+  private var recognizerNames: [String] = []
   /// The "minutes are on but there's no key" warning, cleared when AI minutes are switched on.
   private var minutesWarning: String?
   private var lastSpeechAt = Date()
@@ -160,13 +169,13 @@ final class SessionController: ObservableObject {
       if let meeting = await CalendarContext.currentMeeting() {
         config.eventTitle = meeting.title
         config.attendees = meeting.attendees
-        if !meeting.attendees.isEmpty, let minutes = config.minutes {
-          config.minutes = minutes.adding(
-            context: "Attendees from the calendar invite: " + meeting.attendees.joined(separator: ", "))
-        }
       }
     }
     self.config = config
+    // The invite's attendees go to the minutes as participants, which you can correct in the Context tab.
+    context = MeetingContext(attendees: config.attendees)
+    contextTask?.cancel()
+    minutesContext = nil
     entries = []
     livePartials = [:]
     segments = []
@@ -218,12 +227,14 @@ final class SessionController: ObservableObject {
         for source in sources { histories[source] = AudioHistory() }
         loadParakeet()
       }
+      recognizerNames = context.names
+      let vocabulary = Self.vocabulary(config.vocabulary, recognizerNames)
       for source in sources {
-        let pipeline = try await SpeechPipeline.make(source: source, locale: locale, vocabulary: config.vocabulary)
+        let pipeline = try await SpeechPipeline.make(source: source, locale: locale, vocabulary: vocabulary)
         pipeline.start { [weak self] event in await self?.handle(event) }
         pipelines[source] = pipeline
         if let secondLocale {
-          let second = try await SpeechPipeline.make(source: source, locale: secondLocale, vocabulary: config.vocabulary)
+          let second = try await SpeechPipeline.make(source: source, locale: secondLocale, vocabulary: vocabulary)
           second.start { [weak self] event in await self?.handle(event) }
           secondaryPipelines[source] = second
           arbiters[source] = LanguageArbiter(primary: locale.identifier, secondary: secondLocale.identifier)
@@ -262,6 +273,7 @@ final class SessionController: ObservableObject {
       }
 
       document = try TranscriptDocument(config: config, startedAt: start)
+      document?.context = context
       document?.writeDraft(entries: [])
       startedAt = start
       lastSpeechAt = start
@@ -271,12 +283,14 @@ final class SessionController: ObservableObject {
       startPreviewLoop()
       if let minutesConfig = config.minutes {
         let runner = MinutesRunner(config: minutesConfig) { [weak self] state in self?.minutesChanged(state) }
+        runner.meetingContext = context.promptText
         minutesRunner = runner
         runner.start()
       } else {
         // No AI minutes: the pane is for your own notes, saved with the transcript.
         minutes = MinutesState(usesAI: false, model: "", provider: AppSettings.shared.provider)
       }
+      contextChanged()  // picks up anything typed into the Context tab while starting
       Log.write("recording: sources=\(sources.map(\.rawValue)) locale=\(locale.identifier)")
     } catch {
       Log.write("start failed: \(error)")
@@ -379,6 +393,7 @@ final class SessionController: ObservableObject {
     if let minutesRunner {
       phase = .finishing("Writing minutes…")
       finalMinutes = await minutesRunner.finalize(transcript: Self.minutesTranscript(turns: turns, bookmarks: bookmarks))
+      minutesContext = context
       if finalMinutes == nil, let live = minutes?.text, !live.isEmpty {
         finalMinutes = live
         notes.append("The final minutes couldn't be written (\(minutes?.error ?? "unknown error")); these are the last live minutes.")
@@ -398,6 +413,8 @@ final class SessionController: ObservableObject {
         }
       }
     }
+    contextTask?.cancel()
+    document.context = context
     finished = FinishedMeeting(
       document: document, turns: turns, endedAt: endedAt, notes: notes, audioFiles: audioFiles, minutes: finalMinutes,
       bookmarks: bookmarks, config: config, voices: voicesByName)
@@ -713,7 +730,8 @@ final class SessionController: ObservableObject {
     let client = MinutesClient(provider: settings.provider, model: settings.minutesModel, apiKey: key)
     Task {
       do {
-        let result = try await client.answer(question: question, transcript: transcript, language: language)
+        let result = try await client.answer(
+          question: question, transcript: transcript, language: language, context: context.promptText)
         questions[index].answer = result.text
         Log.write("question answered, usage in=\(result.usage.input) out=\(result.usage.output)")
         if isIdle { rewriteFinished() }
@@ -859,15 +877,12 @@ final class SessionController: ObservableObject {
   func startAIMinutes() {
     let meetingConfig = isRecording ? config : finished?.config
     guard canStartAIMinutes, let meetingConfig,
-      var minutesConfig = AppSettings.shared.minutesConfig(for: meetingConfig.mode, evenIfOff: true)
+      let minutesConfig = AppSettings.shared.minutesConfig(for: meetingConfig.mode, evenIfOff: true)
     else { return }
-    if !meetingConfig.attendees.isEmpty {
-      minutesConfig = minutesConfig.adding(
-        context: "Attendees from the calendar invite: " + meetingConfig.attendees.joined(separator: ", "))
-    }
     finishEditingMinutes()  // notes still being typed count too
     let notes = minutes?.text ?? ""
     let runner = MinutesRunner(config: minutesConfig) { [weak self] state in self?.minutesChanged(state) }
+    runner.meetingContext = context.promptText
     if !notes.isEmpty { runner.finishEditing(text: notes) }
     minutes = runner.state
     if warning == minutesWarning { warning = nil }
@@ -886,13 +901,90 @@ final class SessionController: ObservableObject {
       runner.start()
       runner.updateNow()
     } else if let f = finished {
+      let used = context
       Task {
         guard let text = await runner.finalize(transcript: Self.minutesTranscript(turns: f.turns, bookmarks: f.bookmarks))
         else { return }  // the error shows in the pane; your notes stay as they were
         f.document.usesAIMinutes = true
         finished?.minutes = text
+        minutesContext = used
         rewriteFinished()
       }
+    }
+  }
+
+  // MARK: Context
+
+  private func contextChanged() {
+    contextTask?.cancel()
+    contextTask = Task { [weak self] in
+      try? await Task.sleep(for: .seconds(1))
+      guard !Task.isCancelled else { return }
+      await self?.applyContext()
+    }
+  }
+
+  /// Hands the Context tab to the minutes, the recognizers and the file. Questions read it when asked.
+  private func applyContext() async {
+    let context = self.context
+    if isRecording, let config {
+      minutesRunner?.meetingContext = context.promptText
+      document?.context = context
+      document?.writeDraft(entries: entries, minutes: minutes?.text)
+      if context.names != recognizerNames {
+        recognizerNames = context.names
+        let vocabulary = Self.vocabulary(config.vocabulary, recognizerNames)
+        for pipeline in Array(pipelines.values) + Array(secondaryPipelines.values) {
+          await pipeline.setVocabulary(vocabulary)
+        }
+      }
+    } else if isIdle, let f = finished {
+      f.document.context = context
+      rewriteFinished()
+    } else {
+      return  // starting or finishing: picked up when that's done
+    }
+    Log.write("context: \(context.people.count) participants, \(context.aboutText.count) characters about the meeting")
+  }
+
+  /// Settings' vocabulary plus the participants' names, without repeats.
+  private static func vocabulary(_ terms: [String], _ names: [String]) -> [String] {
+    (terms + names).reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+  }
+
+  /// After the meeting, once the context has changed since the minutes were written.
+  var canRedoMinutes: Bool {
+    guard isIdle, let f = finished, f.minutes?.isEmpty == false, let minutes, minutes.usesAI, !minutes.isUpdating,
+      let minutesContext
+    else { return false }
+    return minutesContext != context && canAsk
+  }
+
+  /// "Redo Minutes" in the Context tab: final minutes again, from the whole transcript and the
+  /// current minutes, with the new context.
+  func redoMinutes() {
+    guard canRedoMinutes, let f = finished,
+      let minutesConfig = AppSettings.shared.minutesConfig(for: f.config.mode, evenIfOff: true)
+    else { return }
+    finishEditingMinutes()
+    let draft = finished?.minutes
+    let document = f.document
+    let runner = MinutesRunner(config: minutesConfig, draft: draft) { [weak self] state in
+      // Not once another meeting has started.
+      guard let self, self.finished?.document === document else { return }
+      self.minutesChanged(state)
+    }
+    runner.meetingContext = context.promptText
+    let used = context
+    minutes = runner.state
+    Log.write("minutes redone with a changed context")
+    Task {
+      guard let text = await runner.finalize(transcript: Self.minutesTranscript(turns: f.turns, bookmarks: f.bookmarks)),
+        finished?.document === document
+      else { return }  // the error shows in the pane; the minutes stay as they were
+      finished?.minutes = text
+      minutesContext = used
+      rewriteFinished()
     }
   }
 

@@ -39,7 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   /// kurzschrift://start?mode=translate|transcribe, kurzschrift://stop,
   /// kurzschrift://toggle?mode=... — for Shortcuts, Raycast, hotkey tools.
-  /// The developer links (start?audio=, snapshot, edit-minutes, window) only work while
+  /// The developer links (start?audio=, snapshot, edit-minutes, window, context) only work while
   /// Settings → General allows them, because any web page can try to open a kurzschrift:// link.
   @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
     guard let string = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     else { return }
     let mode = components.queryItems?.first { $0.name == "mode" }?.value.flatMap(MeetingMode.init(rawValue:))
     func query(_ name: String) -> String? { components.queryItems?.first { $0.name == name }?.value }
-    let isDeveloperLink = ["snapshot", "edit-minutes", "window"].contains(action)
+    let isDeveloperLink = ["snapshot", "edit-minutes", "window", "context"].contains(action)
       || (action == "start" && query("audio") != nil)
     // Parameter names only: a question, a speaker's name or minutes text doesn't belong in the log.
     Log.write("url: \(action) \((components.queryItems ?? []).map(\.name).joined(separator: ","))")
@@ -63,7 +63,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let mode { await session.start(mode, testAudio: audio) }
       case "stop": await session.stop()
       case "minutes":
-        if session.canStartAIMinutes { session.startAIMinutes() } else { session.updateMinutesNow() }
+        if session.canStartAIMinutes {
+          session.startAIMinutes()
+        } else if session.canRedoMinutes {
+          session.redoMinutes()
+        } else {
+          session.updateMinutesNow()
+        }
       case "bookmark": session.addBookmark()
       case "snapshot":
         if let path = query("path"), path.lowercased().hasSuffix(".png") {
@@ -90,9 +96,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           session.finishEditingMinutes()
         }
       case "window":
-        // Developer hook: size=small or size=full.
+        // Developer hook: size=small or size=full, tab=minutes, ask or context.
         if let size = query("size") { AppSettings.shared.liveWindowSmall = size == "small" }
+        if let tab = query("tab") { UserDefaults.standard.set(tab, forKey: "liveSideTab") }
         LiveWindowController.shared.show()
+      case "context":
+        // Developer hook: fills in the Context tab; a parameter left out keeps its text.
+        if let participants = query("participants") { session.context.participants = participants }
+        if let about = query("about") { session.context.about = about }
       case "toggle":
         if session.isRecording { await session.stop() } else if let mode { await session.start(mode) }
       default: break

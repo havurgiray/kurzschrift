@@ -203,6 +203,8 @@ final class TranscriptDocument {
   let url: URL
   private let config: SessionConfig
   private let startedAt: Date
+  /// Who's in the meeting and what it's about, from the Context tab.
+  var context = MeetingContext()
 
   init(config: SessionConfig, startedAt: Date) throws {
     self.config = config
@@ -232,9 +234,11 @@ final class TranscriptDocument {
   func draftMarkdown(entries: [SessionController.LiveEntry], minutes: String?) -> String {
     var md = header(endedAt: nil, speakers: [])
     md += "_Recording in progress. Speakers are identified when the recording stops._\n\n"
+    md += context.markdown
     if let minutes, !minutes.isEmpty {
-      md += "## \(minutesHeading) (live draft)\n\n\(minutes)\n\n## Transcript\n\n"
+      md += "## \(minutesHeading) (live draft)\n\n\(minutes)\n\n"
     }
+    if !context.isEmpty || minutes?.isEmpty == false { md += "## Transcript\n\n" }
     for entry in entries {
       if entry.isBookmark {
         md += Self.bookmarkMarkdown(entry.start)
@@ -271,6 +275,7 @@ final class TranscriptDocument {
     if !audioFiles.isEmpty {
       md += "Audio: " + audioFiles.map { "[\($0.lastPathComponent)](<\($0.lastPathComponent)>)" }.joined(separator: ", ") + "\n\n"
     }
+    md += context.markdown
     if let minutes, !minutes.isEmpty {
       md += "## \(minutesHeading)\n\n\(minutes)\n\n"
     }
@@ -278,7 +283,9 @@ final class TranscriptDocument {
       md += "## Questions\n\n"
       for item in qa { md += "**Q: \(item.question)**\n\n\(item.answer)\n\n" }
     }
-    if (minutes?.isEmpty == false || !qa.isEmpty), !(config.mode == .translate && config.layout == .sections) {
+    if minutes?.isEmpty == false || !qa.isEmpty || !context.isEmpty,
+      !(config.mode == .translate && config.layout == .sections)
+    {
       md += "## Transcript\n\n"
     }
     if turns.isEmpty { md += "_No speech was recognized._\n" }
@@ -329,6 +336,11 @@ final class TranscriptDocument {
     }
     if !config.attendees.isEmpty {
       front += "attendees: [" + config.attendees.map { "\"\($0)\"" }.joined(separator: ", ") + "]\n"
+    }
+    let participants = context.names
+    if !participants.isEmpty {
+      front += "participants: ["
+        + participants.map { "\"\($0.replacingOccurrences(of: "\"", with: "'"))\"" }.joined(separator: ", ") + "]\n"
     }
     front += "---\n\n"
     let title = "# \(Self.kindTitle(config)), \(Self.titleDate.string(from: startedAt))\n\n"

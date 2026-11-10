@@ -84,7 +84,7 @@ struct MinutesConfig {
   let language: String
   /// The prompt from Settings → Minutes (the default unless edited).
   let prompt: String
-  /// Context the app adds below the prompt: vocabulary, calendar attendees.
+  /// Context the app adds below the prompt: the vocabulary from Settings.
   let context: String
 
   func adding(context extra: String) -> MinutesConfig {
@@ -177,14 +177,18 @@ final class MinutesClient: @unchecked Sendable {
       system: system, chunks: transcriptChunks, tail: tail, effort: final ? "medium" : "low", longCache: longCache)
   }
 
-  /// Answers a question about the meeting from its transcript (the "Ask" tab).
-  func answer(question: String, transcript: String, language: String) async throws -> (text: String, usage: MinutesUsage) {
-    let system = """
+  /// Answers a question about the meeting from its transcript (the "Ask" tab). `context` is what
+  /// you entered in the Context tab.
+  func answer(question: String, transcript: String, language: String, context: String = "") async throws
+    -> (text: String, usage: MinutesUsage)
+  {
+    var system = """
       You answer questions about a meeting from its transcript, which comes from automatic speech \
       recognition, so expect misheard words and names. Answer in \(language), briefly, and cite the \
       times you rely on as [hh:mm:ss]. If the transcript doesn't contain the answer, say so instead of \
       guessing.
       """
+    if !context.isEmpty { system += "\n\n\(context)" }
     return try await sendWithRetry(
       system: system, chunks: [transcript], tail: "Question: \(question)", effort: "low", longCache: false)
   }
@@ -467,6 +471,8 @@ struct MinutesEdit: Equatable {
 @MainActor
 final class MinutesRunner {
   let config: MinutesConfig
+  /// What you entered in the Context tab; the next update uses it.
+  var meetingContext = ""
   private let client: MinutesClient
   private var chunks: [String] = []
   private var pendingLines: [String] = []
@@ -487,12 +493,19 @@ final class MinutesRunner {
   /// Seconds between updates; follows "Update every" in Settings, even mid-meeting.
   private(set) var interval: TimeInterval
 
-  init(config: MinutesConfig, publish: @escaping (MinutesState) -> Void) {
+  /// `draft`: minutes to start from, e.g. the finished meeting's when they're redone with a new context.
+  init(config: MinutesConfig, draft: String? = nil, publish: @escaping (MinutesState) -> Void) {
     self.config = config
     self.publish = publish
     interval = config.interval
     client = MinutesClient(provider: config.provider, model: config.model, apiKey: config.apiKey)
     state = MinutesState(model: config.model, provider: config.provider)
+    if let draft { state.text = draft }
+  }
+
+  /// The settings' context (vocabulary) plus the meeting's own.
+  private var requestConfig: MinutesConfig {
+    meetingContext.isEmpty ? config : config.adding(context: meetingContext)
   }
 
   /// Only the 5-minute cache stays warm between updates that start less than 5 minutes apart.
@@ -611,7 +624,7 @@ final class MinutesRunner {
     do {
       let result = try await client.minutes(
         transcriptChunks: chunks, previousMinutes: state.text.isEmpty ? nil : state.text, edits: edits,
-        config: config, final: false, longCache: longCache)
+        config: requestConfig, final: false, longCache: longCache)
       state.usage = state.usage + result.usage
       state.cost = state.usage.estimatedCost(model: config.model, longCache: longCache)
       state.error = nil
@@ -650,7 +663,7 @@ final class MinutesRunner {
     do {
       let result = try await client.minutes(
         transcriptChunks: [transcript], previousMinutes: state.text.isEmpty ? nil : state.text, edits: edits,
-        config: config, final: true, longCache: false)
+        config: requestConfig, final: true, longCache: false)
       state.text = result.text
       state.editsPending = false
       state.updatedAt = Date()
