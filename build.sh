@@ -46,6 +46,9 @@ cp Info.plist "$APP/Contents/"
 for bundle in "$BIN"/*.bundle; do
   [ -e "$bundle" ] && cp -R "$bundle" "$APP/Contents/Resources/"
 done
+# Kurzschrift's license and the notices of what it includes (notices/make.py builds them).
+cp LICENSE "$APP/Contents/Resources/LICENSE.txt"
+cp notices/mac.txt "$APP/Contents/Resources/THIRD-PARTY-NOTICES.txt"
 codesign --force --deep --sign - "$APP"
 [ "$INSTALL" = no ] && exit 0
 

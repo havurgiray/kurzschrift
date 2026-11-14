@@ -270,9 +270,14 @@ The Windows version uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (A
 [ONNX Runtime](https://github.com/microsoft/onnxruntime) (MIT) and [NAudio](https://github.com/naudio/NAudio)
 (MIT), from NuGet. Its models are downloaded at first use: Parakeet TDT 0.6B v3 (CC BY 4.0) as converted
 for sherpa-onnx, [Silero VAD](https://github.com/snakers4/silero-vad) (MIT),
-[OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT) (CC BY 4.0, ONNX exports by Xenova),
+[OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT) (Apache 2.0 or CC BY 4.0 depending on the language pair, ONNX
+exports by Xenova),
 [pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0) (MIT) and
 [WeSpeaker](https://github.com/wenet-e2e/wespeaker) ResNet34 (CC BY 4.0).
+
+The full license texts of everything the apps include are in [notices/](notices/): `mac.txt` ships inside
+Kurzschrift.app, `windows.txt` is installed next to Kurzschrift.exe as `THIRD-PARTY-NOTICES.txt`.
+`notices/make.py` rebuilds both from the exact upstream versions.
 
 On the Mac, two sets of models are downloaded at first use and aren't part of this repository. Both are under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), and both are Fluid Inference's modified

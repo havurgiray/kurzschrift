@@ -296,8 +296,15 @@ public sealed class SettingsWindow : Window {
     p.Children.Add(Note("Off by default: any web page can try to open a kurzschrift:// link."));
     p.Children.Add(Heading("About"));
     p.Children.Add(Note($"Kurzschrift {Program.Version} for Windows ({System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture}). " +
-                        "Free software under the AGPL v3. Speech recognition: NVIDIA Parakeet (CC BY 4.0) via sherpa-onnx; translation: OPUS-MT (CC BY 4.0); " +
+                        "Free software under the AGPL v3: https://github.com/havurgiray/kurzschrift. Speech recognition: NVIDIA Parakeet " +
+                        "(CC BY 4.0) via sherpa-onnx; translation: OPUS-MT, University of Helsinki (Apache 2.0 or CC BY 4.0, by language pair); " +
                         "speaker separation: pyannote segmentation 3.0 (MIT) and WeSpeaker (CC BY 4.0)."));
+    var licenses = new Button { Content = "Licenses…", HorizontalAlignment = HorizontalAlignment.Left, Padding = new Thickness(10, 2, 10, 2) };
+    licenses.Click += (_, _) => {
+      var notices = Path.Combine(AppContext.BaseDirectory, "THIRD-PARTY-NOTICES.txt");
+      TrayIcon.Open(File.Exists(notices) ? notices : "https://github.com/havurgiray/kurzschrift/tree/main/notices");
+    };
+    p.Children.Add(licenses);
     return p;
   }
 }
