@@ -142,6 +142,9 @@ final class SessionController: ObservableObject {
   /// redone, how far each track has been redone, and the stretch being redone right now.
   private enum ParakeetState { case off, loading, ready, failed }
   private var parakeetState = ParakeetState.off
+  /// Apple's recognizer isn't available (seen under Rosetta, likely on Intel Macs): Parakeet alone
+  /// recognizes the meeting, a stretch every ~10 s, like the Windows version.
+  private var parakeetOnly = false
   private var parakeet: ParakeetRecognizer?
   private var histories: [AudioSourceKind: AudioHistory] = [:]
   private var refinedUntil: [AudioSourceKind: Double] = [:]
@@ -190,7 +193,19 @@ final class SessionController: ObservableObject {
     if AppSettings.shared.showLiveWindow { LiveWindowController.shared.show() }
 
     do {
-      let locale = try await SpeechPipeline.prepareModel(for: config.spokenLocale)
+      let locale: Locale
+      do {
+        // Hidden testing default: `defaults write local.kurzschrift forceParakeetOnly -bool true`.
+        if UserDefaults.standard.bool(forKey: "forceParakeetOnly") { throw SpeechError.unavailable }
+        locale = try await SpeechPipeline.prepareModel(for: config.spokenLocale)
+      } catch SpeechError.unavailable {
+        parakeetOnly = true
+        locale = config.spokenLocale
+        config.parakeet = true
+        self.config?.parakeet = true
+        let forced = UserDefaults.standard.bool(forKey: "forceParakeetOnly")
+        Log.write("Apple speech recognition unavailable\(forced ? " (forced for testing)" : ""): using Parakeet alone")
+      }
 
       if mode == .translate, let target = config.targetLanguage {
         phase = .starting("Preparing translation…")
@@ -214,7 +229,7 @@ final class SessionController: ObservableObject {
       }
 
       var secondLocale: Locale?
-      if let wanted = config.secondLocale, !LanguageArbiter.sameLanguage(wanted.identifier, locale.identifier) {
+      if !parakeetOnly, let wanted = config.secondLocale, !LanguageArbiter.sameLanguage(wanted.identifier, locale.identifier) {
         phase = .starting("Preparing \(AppSettings.languageName(wanted.identifier)) recognition…")
         secondLocale = try? await SpeechPipeline.prepareModel(for: wanted)
       }
@@ -229,7 +244,7 @@ final class SessionController: ObservableObject {
       }
       recognizerNames = context.names
       let vocabulary = Self.vocabulary(config.vocabulary, recognizerNames)
-      for source in sources {
+      for source in sources where !parakeetOnly {
         let pipeline = try await SpeechPipeline.make(source: source, locale: locale, vocabulary: vocabulary)
         pipeline.start { [weak self] event in await self?.handle(event) }
         pipelines[source] = pipeline
@@ -246,13 +261,13 @@ final class SessionController: ObservableObject {
       recordingFolder = folder
       let start = Date()
       for source in sources {
-        let pipeline = pipelines[source]!
+        let pipeline = pipelines[source]
         let second = secondaryPipelines[source]
         let history = histories[source]
         tracks[source] = try Track(
           kind: source, fileURL: folder.appendingPathComponent("\(source.rawValue).wav"), sessionStart: start
         ) { buffer in
-          pipeline.append(buffer)
+          pipeline?.append(buffer)
           second?.append(buffer)
           history?.append(buffer)
         }
@@ -330,6 +345,10 @@ final class SessionController: ObservableObject {
     livePartials = [:]
     minutesRunner?.stop()
     let endedAt = Date()
+    if parakeetOnly {
+      phase = .finishing("Finishing transcription…")
+      while parakeetState == .loading { try? await Task.sleep(for: .milliseconds(200)) }
+    }
     Log.write("speech finished: \(segments.count) segments")
     if parakeetState == .ready {
       phase = .finishing("Improving the transcript…")
@@ -452,6 +471,7 @@ final class SessionController: ObservableObject {
     sessionID = UUID()
     parakeet = nil
     parakeetState = .off
+    parakeetOnly = false
     histories = [:]
     refinedUntil = [:]
     refining = [:]
@@ -557,6 +577,7 @@ final class SessionController: ObservableObject {
         for line in heldMinutesLines { minutesRunner?.add(line: line) }
         heldMinutesLines = []
         Log.write("parakeet unavailable: \(error)")
+        if parakeetOnly { warning = "Speech recognition couldn't be loaded: \(error.localizedDescription)" }
       }
     }
   }
@@ -568,7 +589,11 @@ final class SessionController: ObservableObject {
     guard parakeetState == .ready, refining[source] == nil, let parakeet, let history = histories[source] else { return }
     let from = refinedUntil[source] ?? 0
     var to = history.duration
-    if !final {
+    if !final, parakeetOnly {
+      // No Apple lines to follow: every ~10 s, cut at the quietest moment of the last few seconds.
+      guard to - from >= 10 else { return }
+      to = Self.quietPoint(history, from: max(from + 6, to - 4), to: to - 0.3) ?? to
+    } else if !final {
       guard let lastEnd = segments.filter({ $0.source == source && !refinedIDs.contains($0.id) }).map(\.end).max(),
         lastEnd - from >= 15
       else { return }
@@ -601,6 +626,23 @@ final class SessionController: ObservableObject {
     }
   }
 
+  /// The middle of the quietest 100 ms between `from` and `to` (a pause between words), on the track's timeline.
+  private static func quietPoint(_ history: AudioHistory, from: Double, to: Double) -> Double? {
+    guard to - from > 0.2 else { return nil }
+    let samples = history.samples(from: from, to: to)
+    let window = Int(sessionAudioFormat.sampleRate / 10)
+    guard samples.count > window else { return nil }
+    var best = (energy: Float.infinity, index: 0)
+    var i = 0
+    while i + window <= samples.count {
+      var energy: Float = 0
+      for k in i..<(i + window) { energy += samples[k] * samples[k] }
+      if energy < best.energy { best = (energy, i) }
+      i += window / 2
+    }
+    return from + Double(best.index + window / 2) / sessionAudioFormat.sampleRate
+  }
+
   /// Swaps Apple's lines up to `to` for Parakeet's sentences, in the window, the draft file and the minutes.
   private func replaceWithRefined(_ words: [TimedWord], source: AudioSourceKind, from: Double, to: Double) async {
     refinedUntil[source] = to
@@ -624,6 +666,10 @@ final class SessionController: ObservableObject {
       if insert(entry, for: segment) {
         minutesRunner?.add(line: Self.minutesLine(segment, speaker: entry.speaker))
       }
+    }
+    if parakeetOnly, !refined.isEmpty {
+      lastSpeechAt = Date()  // there are no Apple results to count as speech
+      autoStopIn = nil
     }
     document?.writeDraft(entries: entries, minutes: minutes?.text)
     Log.write("parakeet \(source) \(Int(from))-\(Int(to)) s: \(replaced.count) lines became \(refined.count)")
@@ -1036,6 +1082,7 @@ final class SessionController: ObservableObject {
         guard let self, self.phase == .recording, let startedAt = self.startedAt else { continue }
         let elapsed = Int(Date().timeIntervalSince(startedAt))
         if elapsed != self.elapsedSeconds { self.elapsedSeconds = elapsed }
+        if self.parakeetOnly { for source in Array(self.histories.keys) { self.refine(source) } }
         self.checkAutoStop()
         // Decide mixed-language windows once both recognizers have finalized past them.
         let now = Date().timeIntervalSince(startedAt)
