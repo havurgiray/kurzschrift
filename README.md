@@ -1,8 +1,9 @@
 # Kurzschrift
 
-*Kurzschrift* is German for shorthand. It's a free macOS menu bar app for live meeting translation
-and transcription. Speech recognition, translation and speaker separation run on your Mac; only the
-optional AI minutes and questions use an online API.
+*Kurzschrift* is German for shorthand. It's a free app for live meeting translation and
+transcription, in the menu bar on macOS and in the notification area on Windows. Speech recognition,
+translation and speaker separation run on your computer; only the optional AI minutes and questions
+use an online API.
 
 | | Translate Meeting | Transcribe Meeting |
 |---|---|---|
@@ -16,11 +17,13 @@ Everything in the table can be changed in **Settings…**.
 
 ## Requirements and installing
 
-macOS 26 or later (it uses Apple's SpeechAnalyzer) on an Apple Silicon Mac.
+**Mac:** macOS 26 or later (it uses Apple's SpeechAnalyzer) on an Apple Silicon Mac.
 
-**Download:**
+**Windows:** see [Kurzschrift for Windows](#kurzschrift-for-windows).
 
-1. Download `Kurzschrift-<version>.zip` from [Releases](https://github.com/havurgiray/kurzschrift/releases/latest), open it, and move **Kurzschrift.app** into Applications.
+**Download for Mac:**
+
+1. Download `Kurzschrift-<version>-mac-arm64.dmg` from [Releases](https://github.com/havurgiray/kurzschrift/releases/latest), open it, and drag **Kurzschrift.app** onto the Applications folder next to it.
 2. Open it. macOS says it could not verify the app, because it isn't notarized by Apple (that needs a paid Apple developer account). Click **Done**.
 3. Open System Settings → Privacy & Security, scroll down to "Kurzschrift was blocked…", click **Open Anyway** and confirm with your password or Touch ID. You do this once for each new version.
 
@@ -132,6 +135,53 @@ open "kurzschrift://ask?q=What%20did%20we%20decide%3F"
 open "kurzschrift://rename?from=Speaker%202&to=Maria"   # after a meeting; &remember=no to skip the voice
 ```
 
+## Kurzschrift for Windows
+
+Windows 10 (version 2004 or later) or Windows 11, on a 64-bit Intel/AMD PC (x64) or an ARM PC
+(Snapdragon). About 1 GB of disk for the models and 2 GB of memory while recording.
+
+**Download and install:**
+
+1. Download `Kurzschrift-<version>-windows-x64-setup.exe` from [Releases](https://github.com/havurgiray/kurzschrift/releases/latest),
+   or `…-windows-arm64-setup.exe` for an ARM PC.
+2. Run it. Windows SmartScreen says "Windows protected your PC", because the installer isn't signed
+   (that needs a paid certificate). Click **More info → Run anyway**. It installs for your user
+   only, so it doesn't ask for administrator rights.
+3. The speech bubble appears in the notification area (bottom right; it may be under the ^ arrow).
+   The first meeting downloads the models once, about 0.7 GB: speech recognition 640 MB, translation
+   about 110 MB per language pair, speaker separation 33 MB. They're kept in
+   `%LOCALAPPDATA%\Kurzschrift\Models`.
+
+**What's the same as on the Mac:** the menu (right-click the speech bubble), the meeting window with
+Minutes, Ask and Context, the small bar, subtitles, bookmarks, auto-stop after silence, speaker
+separation and renaming (with "remember this voice"), the `.md` transcript format, AI minutes with your
+own API key (same `api-keys.json` format, in `%APPDATA%\Kurzschrift`), and `kurzschrift://` links.
+
+**What's different:**
+
+- Speech recognition is NVIDIA Parakeet v3 alone (25 European languages, recognized without being
+  told which). Text appears a sentence at a time; while someone talks, a provisional version is
+  refreshed every 2 seconds (Settings → General).
+- Translation is OPUS-MT from the University of Helsinki, on your PC. From English into 13 languages
+  and into English from 14; other pairs go through English. Its English is plainer than Apple's.
+- Meeting audio is whatever Windows' default output device plays. If Teams plays on a headset that
+  isn't the default, choose it in Settings → General → Audio devices.
+- Global shortcuts: Ctrl+Alt+T (translate), Ctrl+Alt+R (transcribe), Ctrl+Alt+B (bookmark).
+- Call detection notices Teams, Zoom, Webex, Slack and Discord through Windows' own list of apps using
+  the microphone, and offers to translate or transcribe.
+- The recording is kept as MP3. Not on Windows yet: the calendar, and handing Context names to the
+  speech recognizer (the minutes get them).
+
+**Status:** tested in a Windows 11 ARM virtual machine with recorded and replayed German meetings,
+including a 44-minute live-capture test, but not yet in a real Teams call on a real PC.
+
+**Build it yourself** with the .NET 10 SDK and Inno Setup 6, in PowerShell:
+
+```powershell
+windows\build.ps1                 # both installers into windows\dist
+windows\build.ps1 -Arch x64 -NoInstaller
+```
+
 ## How it works (all on this Mac)
 
 - **Meeting audio** comes from a Core Audio process tap (vendored [audiotee](https://github.com/makeusabrew/audiotee), MIT). No BlackHole or virtual device, and it doesn't change your output.
@@ -216,7 +266,15 @@ It comes with no warranty.
 The vendored packages in `Vendor/` keep their own licenses: audiotee is MIT, FluidAudio is
 Apache 2.0 (see [Vendor/README.md](Vendor/README.md)).
 
-Two sets of models are downloaded at first use and aren't part of this repository. Both are under
+The Windows version uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache 2.0),
+[ONNX Runtime](https://github.com/microsoft/onnxruntime) (MIT) and [NAudio](https://github.com/naudio/NAudio)
+(MIT), from NuGet. Its models are downloaded at first use: Parakeet TDT 0.6B v3 (CC BY 4.0) as converted
+for sherpa-onnx, [Silero VAD](https://github.com/snakers4/silero-vad) (MIT),
+[OPUS-MT](https://github.com/Helsinki-NLP/Opus-MT) (CC BY 4.0, ONNX exports by Xenova),
+[pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0) (MIT) and
+[WeSpeaker](https://github.com/wenet-e2e/wespeaker) ResNet34 (CC BY 4.0).
+
+On the Mac, two sets of models are downloaded at first use and aren't part of this repository. Both are under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), and both are Fluid Inference's modified
 Core ML conversions:
 
