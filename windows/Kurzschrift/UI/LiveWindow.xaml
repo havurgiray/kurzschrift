@@ -1,0 +1,185 @@
+<Window x:Class="Kurzschrift.LiveWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:Kurzschrift"
+        Title="Kurzschrift" Width="980" Height="660" MinWidth="380" MinHeight="96"
+        WindowStartupLocation="CenterScreen">
+  <Window.Resources>
+    <local:VisibleIfConverter x:Key="VisibleIf" />
+    <local:VisibleIfNotConverter x:Key="VisibleIfNot" />
+    <Style x:Key="Small" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Opacity" Value="0.7" />
+    </Style>
+    <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Padding" Value="10,3" />
+      <Setter Property="Margin" Value="4,0,0,0" />
+    </Style>
+  </Window.Resources>
+
+  <Grid x:Name="Root">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+
+    <!-- Top bar -->
+    <DockPanel Grid.Row="0" Margin="12,8,12,6" LastChildFill="True">
+      <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+        <Button x:Name="BookmarkButton" Content="⭐ Bookmark" ToolTip="Mark this moment as important (Ctrl+Alt+B)" Click="Bookmark_Click"
+                Visibility="{Binding IsRecording, Converter={StaticResource VisibleIf}}" />
+        <Button x:Name="StopButton" Content="■ Stop and Save" Click="Stop_Click"
+                Visibility="{Binding IsRecording, Converter={StaticResource VisibleIf}}" />
+        <Button x:Name="OpenButton" Content="Open Transcript" Click="Open_Click" />
+        <Button x:Name="PaneButton" Content="Side Pane" ToolTip="Minutes, questions and context" Click="Pane_Click" />
+        <Button x:Name="SizeButton" Content="▁ Bar" ToolTip="Shrink to a small bar / expand" Click="Size_Click" />
+      </StackPanel>
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <Ellipse x:Name="RecordingDot" Width="10" Height="10" Fill="#E53935" Margin="0,0,8,0" VerticalAlignment="Center"
+                 Visibility="{Binding IsRecording, Converter={StaticResource VisibleIf}}" />
+        <TextBlock x:Name="StatusText" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center" />
+        <TextBlock x:Name="SmallLine" Margin="14,0,0,0" FontSize="15" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+      </StackPanel>
+    </DockPanel>
+
+    <!-- Warnings -->
+    <StackPanel Grid.Row="1">
+      <Border x:Name="WarningBanner" Background="#33FFC107" Padding="12,6" Margin="12,0,12,6" CornerRadius="6"
+              Visibility="{Binding Warning, Converter={StaticResource VisibleIf}}">
+        <TextBlock Text="{Binding Warning}" TextWrapping="Wrap" />
+      </Border>
+      <Border x:Name="AutoStopBanner" Background="#332B6CD8" Padding="12,6" Margin="12,0,12,6" CornerRadius="6"
+              Visibility="{Binding AutoStopIn, Converter={StaticResource VisibleIf}}">
+        <DockPanel>
+          <Button DockPanel.Dock="Right" Content="Keep Recording" Click="Keep_Click" />
+          <TextBlock x:Name="AutoStopText" VerticalAlignment="Center" TextWrapping="Wrap" />
+        </DockPanel>
+      </Border>
+    </StackPanel>
+
+    <!-- Transcript and side pane -->
+    <Grid x:Name="Body" Grid.Row="2">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" MinWidth="200" />
+        <ColumnDefinition x:Name="SplitterColumn" Width="6" />
+        <ColumnDefinition x:Name="PaneColumn" Width="360" MinWidth="0" />
+      </Grid.ColumnDefinitions>
+
+      <DockPanel Grid.Column="0">
+        <ItemsControl x:Name="PartialList" DockPanel.Dock="Bottom" ItemsSource="{Binding Partials}" Margin="16,0,16,10">
+          <ItemsControl.ItemTemplate>
+            <DataTemplate>
+              <StackPanel Margin="0,6,0,0" Opacity="0.65">
+                <TextBlock Text="{Binding Speaker}" Style="{StaticResource Small}"
+                           Visibility="{Binding Speaker, Converter={StaticResource VisibleIf}}" />
+                <TextBlock Text="{Binding Original}" TextWrapping="Wrap" FontStyle="Italic"
+                           FontSize="{DynamicResource OriginalSize}" />
+                <TextBlock Text="{Binding Translation}" TextWrapping="Wrap" FontStyle="Italic" FontSize="{DynamicResource MainSize}"
+                           Visibility="{Binding Translation, Converter={StaticResource VisibleIf}}" />
+              </StackPanel>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        <Grid>
+          <ListBox x:Name="EntryList" ItemsSource="{Binding Entries}" BorderThickness="0" Background="Transparent"
+                   HorizontalContentAlignment="Stretch" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                   VirtualizingPanel.ScrollUnit="Pixel" Padding="8,0,8,0">
+            <ListBox.ItemContainerStyle>
+              <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
+                <Setter Property="Focusable" Value="False" />
+                <Setter Property="Padding" Value="8,6" />
+              </Style>
+            </ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate>
+              <DataTemplate>
+                <StackPanel>
+                  <StackPanel.ContextMenu>
+                    <ContextMenu>
+                      <MenuItem Header="Rename Speaker…" Click="Rename_Click" />
+                      <MenuItem Header="Copy" Click="CopyEntry_Click" />
+                    </ContextMenu>
+                  </StackPanel.ContextMenu>
+                  <TextBlock Text="{Binding Heading}" FontWeight="SemiBold" FontSize="12" Opacity="0.75" Margin="0,0,0,2" />
+                  <TextBlock Text="{Binding Original}" TextWrapping="Wrap" FontSize="{DynamicResource OriginalSize}"
+                             Opacity="{DynamicResource OriginalOpacity}" Visibility="{Binding IsBookmark, Converter={StaticResource VisibleIfNot}}" />
+                  <TextBlock Text="{Binding Translation}" TextWrapping="Wrap" FontSize="{DynamicResource MainSize}" Margin="0,2,0,0"
+                             Visibility="{Binding Translation, Converter={StaticResource VisibleIf}}" />
+                </StackPanel>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+          <TextBlock x:Name="EmptyText" HorizontalAlignment="Center" VerticalAlignment="Center" Opacity="0.6"
+                     TextWrapping="Wrap" TextAlignment="Center" Margin="24" />
+        </Grid>
+      </DockPanel>
+
+      <GridSplitter x:Name="Splitter" Grid.Column="1" Width="6" HorizontalAlignment="Stretch" Background="Transparent" />
+
+      <TabControl x:Name="SideTabs" Grid.Column="2" Margin="0,0,8,8" SelectionChanged="SideTabs_SelectionChanged">
+        <TabItem Header="Minutes" Tag="minutes">
+          <DockPanel Margin="6">
+            <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button x:Name="AIMinutesButton" Content="AI Minutes" Click="AIMinutes_Click"
+                        ToolTip="Write minutes from the transcript with your API key" />
+                <Button x:Name="UpdateMinutesButton" Content="Update Now" Click="UpdateMinutes_Click" />
+                <Button x:Name="EditMinutesButton" Content="Edit" Click="EditMinutes_Click" />
+                <Button x:Name="CancelEditButton" Content="Cancel" Click="CancelEdit_Click" />
+              </StackPanel>
+              <TextBlock x:Name="MinutesStatus" Style="{StaticResource Small}" VerticalAlignment="Center" TextWrapping="Wrap" />
+            </DockPanel>
+            <Grid>
+              <TextBox x:Name="MinutesBox" TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                       IsReadOnly="True" BorderThickness="0" TextChanged="MinutesBox_TextChanged" />
+              <TextBlock x:Name="MinutesEmpty" Opacity="0.6" TextWrapping="Wrap" Margin="6" IsHitTestVisible="False" />
+            </Grid>
+          </DockPanel>
+        </TabItem>
+        <TabItem Header="Ask" Tag="ask">
+          <DockPanel Margin="6">
+            <DockPanel DockPanel.Dock="Bottom" Margin="0,6,0,0">
+              <Button DockPanel.Dock="Right" x:Name="AskButton" Content="Ask" Click="Ask_Click" IsDefault="False" />
+              <TextBox x:Name="QuestionBox" KeyDown="QuestionBox_KeyDown" ToolTip="Ask about the meeting so far" />
+            </DockPanel>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <ItemsControl ItemsSource="{Binding Questions}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <StackPanel Margin="0,0,0,12">
+                      <TextBlock Text="{Binding Question}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                      <TextBox Text="{Binding Answer, Mode=OneWay}" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+                               TextWrapping="Wrap" Visibility="{Binding Answer, Converter={StaticResource VisibleIf}}" />
+                      <TextBlock Text="{Binding Error}" Foreground="#E53935" TextWrapping="Wrap"
+                                 Visibility="{Binding Error, Converter={StaticResource VisibleIf}}" />
+                    </StackPanel>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+          </DockPanel>
+        </TabItem>
+        <TabItem Header="Context" Tag="context">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="6">
+              <TextBlock Text="Participants" FontWeight="SemiBold" />
+              <TextBlock Style="{StaticResource Small}" TextWrapping="Wrap" Margin="0,2,0,4"
+                         Text="One per line, optionally with a role: Maria Huber – project lead" />
+              <TextBox x:Name="ParticipantsBox" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="90"
+                       VerticalScrollBarVisibility="Auto" TextChanged="Context_TextChanged" />
+              <TextBlock Text="About the meeting" FontWeight="SemiBold" Margin="0,12,0,0" />
+              <TextBlock Style="{StaticResource Small}" TextWrapping="Wrap" Margin="0,2,0,4"
+                         Text="Topic, agenda, background, abbreviations: anything that helps make sense of it." />
+              <TextBox x:Name="AboutBox" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="120"
+                       VerticalScrollBarVisibility="Auto" TextChanged="Context_TextChanged" />
+              <Button x:Name="RedoMinutesButton" Content="Redo Minutes" HorizontalAlignment="Left" Margin="0,10,0,0"
+                      Click="Redo_Click" />
+              <TextBlock x:Name="ContextNote" Style="{StaticResource Small}" TextWrapping="Wrap" Margin="0,8,0,0" />
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+      </TabControl>
+    </Grid>
+  </Grid>
+</Window>

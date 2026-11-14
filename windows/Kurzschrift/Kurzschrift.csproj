@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Kurzschrift for Windows: live meeting transcription and translation in the notification area. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Kurzschrift</RootNamespace>
+    <AssemblyName>Kurzschrift</AssemblyName>
+    <Version>1.2.0</Version>
+    <Product>Kurzschrift</Product>
+    <Copyright>Giray Havur, AGPL-3.0</Copyright>
+    <ApplicationIcon>Assets\Kurzschrift.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <StartupObject>Kurzschrift.Program</StartupObject>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+    <!-- No debug info in the release build: it would carry the build machine's paths. -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+  <ItemGroup>
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+    <Using Include="System.IO" />
+    <Using Include="System.Net.Http" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="org.k2fsa.sherpa.onnx" Version="2.0.1" />
+    <!-- Managed API only: it uses the onnxruntime.dll that sherpa-onnx ships (1.28.2). -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Managed" Version="1.28.0" />
+    <PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
+    <PackageReference Include="NAudio.Core" Version="2.2.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets\Kurzschrift.ico" />
+  </ItemGroup>
+</Project>
