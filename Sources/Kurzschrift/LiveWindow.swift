@@ -221,6 +221,9 @@ private struct StartMenu: View {
       ForEach(MeetingMode.allCases) { mode in
         Button(settings.menuTitle(for: mode)) { Task { await session.start(mode) } }
       }
+      if let title = settings.secondTranscribeTitle {
+        Button(title) { Task { await session.start(.transcribe, secondLanguage: true) } }
+      }
     }
     .fixedSize(horizontal: true, vertical: false)
     .menuStyle(.button)
@@ -384,13 +387,18 @@ private struct TranscriptPane: View {
               .foregroundStyle(.tertiary)
           }
           ForEach(session.entries) { entry in
+            // Text can be selected within one line, not across lines: selection over the whole
+            // lazy list is where the meeting window froze (2026-10-21 and 2026-11-18).
             EntryView(entry: entry, translating: translating, fontSize: fontSize, session: session)
+              .textSelection(.enabled)
           }
           Color.clear.frame(height: 1).id("bottom")
         }
-        .textSelection(.enabled)
         .padding(14)
       }
+      // A fresh list for every meeting: both freezes came early in a meeting after another one
+      // in the same window.
+      .id(session.meetingID)
       // Only scrolling done by the user changes whether the pane follows; new lines arriving and
       // the pane's own scrolling to them don't.
       .onScrollPhaseChange { _, phase in
@@ -401,6 +409,7 @@ private struct TranscriptPane: View {
       } action: { _, atBottom in
         if userScrolling { following = atBottom }
       }
+      .onChange(of: session.meetingID) { following = true }
       .onChange(of: session.entries.count) {
         guard following else { return }
         DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -704,10 +713,10 @@ private struct AskPane: View {
                   ProgressView().controlSize(.small)
                 }
               }
+              .textSelection(.enabled)
               .id(item.id)
             }
           }
-          .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading)
           .padding(12)
         }
@@ -739,8 +748,10 @@ private struct MinutesPane: View {
   private var editing: Bool { session.minutesDraft != nil }
   /// Live minutes are off: only your own notes.
   private var notesOnly: Bool { session.minutes?.usesAI == false }
-  /// Not while the final minutes are being written.
-  private var canEdit: Bool { session.isRecording || (session.isIdle && session.finished != nil) }
+  /// Not while the final minutes are being written, at the end of the meeting or again after it.
+  private var canEdit: Bool {
+    session.isRecording || (session.isIdle && session.finished != nil && session.minutes?.isUpdating != true)
+  }
 
   var body: some View {
     let state = session.minutes
@@ -760,6 +771,11 @@ private struct MinutesPane: View {
             Button("Update now") { session.updateMinutesNow() }
               .controlSize(.small)
               .disabled(state?.isUpdating == true)
+          }
+          if session.canRedoMinutes, state?.error != nil {
+            Button("Try Again") { session.redoMinutes() }
+              .controlSize(.small)
+              .help("Have the minutes written again from the whole transcript")
           }
           if session.canStartAIMinutes {
             Button {

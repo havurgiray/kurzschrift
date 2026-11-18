@@ -65,8 +65,10 @@ final class LanguageArbiter {
   }
 
   private var progress: [String: Double] = [:]
-  /// The last word emitted, to drop its duplicate at a language switch.
+  /// The last word emitted, with its language and end time, to drop its duplicate at a language switch.
   private var lastWord = ""
+  private var lastLanguage = ""
+  private var lastEnd = -Double.infinity
 
   private static func normalized(_ word: String) -> String {
     word.lowercased().filter { $0.isLetter || $0.isNumber }
@@ -205,12 +207,18 @@ final class LanguageArbiter {
       decidedSeconds[language, default: 0] += (winner.map(\.word.end).max() ?? 0) - (winner.map(\.from).min() ?? 0)
       var sorted = winner.sorted { $0.word.end < $1.word.end }
       // At a language switch the losing recognizer's copy of the boundary word ("section",
-      // "Monday") can land in the next part; drop it when it repeats the word just kept.
-      if let first = sorted.first, Self.normalized(first.word.text) == lastWord, !lastWord.isEmpty {
+      // "Monday") can land in the next part; drop it when it repeats the word just kept. Only
+      // then: the same language going on ("…gut." "Gut, dann…") or a later sentence that happens
+      // to start with that word is somebody really saying it twice.
+      if let first = sorted.first, Self.normalized(first.word.text) == lastWord, !lastWord.isEmpty,
+        language != lastLanguage, first.from - lastEnd < 1
+      {
         sorted.removeFirst()
       }
       guard let lastKept = sorted.last else { continue }
       lastWord = Self.normalized(lastKept.word.text)
+      lastLanguage = language
+      lastEnd = lastKept.word.end
       let text = TextCleanup.tidy(sorted.map(\.word.text).joined())
       guard !text.isEmpty else { continue }
       var segment = FinalSegment(

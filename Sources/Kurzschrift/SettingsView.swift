@@ -25,6 +25,39 @@ struct SettingsView: View {
   }
 }
 
+extension SettingsView {
+  /// Developer hook (kurzschrift://snapshot?window=settings&tab=…&path=…): draws one settings tab
+  /// into a PNG, the same way the meeting window's snapshot does, without touching the screen.
+  @MainActor
+  static func snapshot(tab: String, to path: String) {
+    let settings = AppSettings.shared
+    let content: AnyView =
+      switch tab {
+      case "meetings": AnyView(MeetingsSettings(settings: settings))
+      case "translate": AnyView(TranslationSettings(settings: settings))
+      case "transcribe": AnyView(TranscriptionSettings(settings: settings))
+      case "minutes": AnyView(MinutesSettings(settings: settings))
+      case "microphone": AnyView(MicrophoneSettings(settings: settings))
+      default: AnyView(GeneralSettings(settings: settings))
+      }
+    let height: CGFloat = tab == "general" || tab == "minutes" || tab.isEmpty ? 1500 : 700
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 540, height: height), styleMask: [.titled], backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    let host = NSHostingView(rootView: content.frame(width: 540, height: height))
+    window.contentView = host
+    Task { @MainActor in
+      try? await Task.sleep(for: .seconds(2))  // the pickers load their lists first
+      host.layoutSubtreeIfNeeded()
+      if let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+        host.cacheDisplay(in: host.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+      }
+      window.close()
+    }
+  }
+}
+
 private struct GeneralSettings: View {
   @ObservedObject var settings: AppSettings
 
@@ -44,15 +77,15 @@ private struct GeneralSettings: View {
           ForEach(AppSettings.audioBitrateChoices, id: \.self) { Text(AppSettings.audioBitrateName($0)).tag($0) }
         }
         .disabled(!settings.keepAudio)
-        Text("Saved as .m4a (AAC), which plays anywhere. Transcription and speaker separation always use the full-quality recording; this only sets the size of the copy you keep. With your microphone on, there are two files.")
+        Text("Saved as .m4a (AAC), which plays anywhere. Transcription and speaker separation always use the full-quality recording; this only sets the size of the copy you keep. With your microphone on, there are two files. A change here applies from the next meeting.")
           .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Transcripts and recordings")
       }
       Section {
         Toggle("Improve the transcript with Parakeet", isOn: $settings.parakeet)
-        Text("About every 15 seconds, NVIDIA's Parakeet model goes over what was just said again, on this Mac, and its text replaces the first version in the transcript, the minutes and the file: fewer misheard words and whole sentences, in German and English. The live captions stay as they are. Downloads 470 MB the first time.")
+        Text("About every 15 seconds, NVIDIA's Parakeet model goes over what was just said again, on this Mac, and its text replaces the first version in the transcript, the minutes and the file: fewer misheard words and whole sentences, in German and English. The live captions stay as they are. Downloads 470 MB the first time. Switching it applies from the next meeting.")
           .font(.caption).foregroundStyle(.secondary)
-      }
-      Section {
         LabeledContent("Vocabulary") {
           TextEditor(text: $settings.vocabulary)
             .font(.body)
@@ -60,11 +93,8 @@ private struct GeneralSettings: View {
         }
         Text("Names and terms that keep getting misheard, one per line or comma-separated (e.g. Kubernetes, OKR, Maria Huber). They're given to speech recognition and to the minutes. Applies from the next meeting.")
           .font(.caption).foregroundStyle(.secondary)
-      }
-      Section {
-        TextField("Your name", text: $settings.myName, prompt: Text("Me"))
-        Text("Used as the speaker name for your microphone.")
-          .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Recognition")
       }
       Section {
         Toggle("Show the live window when a meeting starts", isOn: $settings.showLiveWindow)
@@ -81,6 +111,8 @@ private struct GeneralSettings: View {
             .frame(width: 180)
           Text("\(Int(settings.liveFontSize)) pt").monospacedDigit().frame(width: 40, alignment: .trailing)
         }
+      } header: {
+        Text("Meeting window")
       }
       VoicesSection(settings: settings)
       Section {
@@ -93,14 +125,19 @@ private struct GeneralSettings: View {
           Slider(value: $settings.subtitleFontSize, in: 18...48, step: 2).frame(width: 180)
           Text("\(Int(settings.subtitleFontSize)) pt").monospacedDigit().frame(width: 40, alignment: .trailing)
         }
+      } header: {
+        Text("Subtitles")
       }
+      UpdatesSection(settings: settings)
       Section {
-        Toggle("Launch at login", isOn: Binding(get: { settings.launchAtLogin }, set: { settings.launchAtLogin = $0 }))
-      }
-      Section {
-        Toggle("Allow developer links", isOn: $settings.developerLinks)
-        Text("For testing Kurzschrift: kurzschrift:// links that replay an audio file as a meeting, save the meeting window as an image, edit the minutes or resize the window. Leave this off otherwise, since any web page can try to open these links. Start, stop, bookmark and the other links work either way.")
+        Toggle("Allow links to ask questions, start AI minutes and rename speakers", isOn: $settings.automationLinks)
+        Text("For Shortcuts and hotkey tools. Off by default: any web page can try to open a kurzschrift:// link, and these send the transcript to your AI provider or change the saved file. Start, stop, toggle and bookmark links always work.")
           .font(.caption).foregroundStyle(.secondary)
+        Toggle("Allow developer links", isOn: $settings.developerLinks)
+        Text("For testing Kurzschrift: links that replay an audio file as a meeting, save a window as an image, edit the minutes or resize the window. Leave this off otherwise.")
+          .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Links")
       }
     }
     .formStyle(.grouped)
@@ -117,6 +154,60 @@ private struct GeneralSettings: View {
   }
 }
 
+/// The version, the update check, and where the licenses are.
+private struct UpdatesSection: View {
+  @ObservedObject var settings: AppSettings
+  @ObservedObject var updates = UpdateChecker.shared
+
+  var body: some View {
+    Section {
+      LabeledContent("Kurzschrift \(UpdateChecker.currentVersion)") {
+        HStack {
+          status
+          Button("Check Now") { Task { await updates.check() } }
+            .disabled(updates.state == .checking)
+        }
+      }
+      Toggle("Launch at login", isOn: Binding(get: { settings.launchAtLogin }, set: { settings.launchAtLogin = $0 }))
+      Toggle("Check for a new version once a day", isOn: $settings.checkForUpdates)
+      Text("Asks GitHub for the number of the latest release, nothing else, and tells you in the menu when there is one. Kurzschrift never downloads or installs anything by itself.")
+        .font(.caption).foregroundStyle(.secondary)
+      LabeledContent("Free software (AGPL v3), no warranty") {
+        HStack {
+          Button("Licenses…") { openBundled("THIRD-PARTY-NOTICES", fallback: "notices/mac.txt") }
+          Button("Source Code") { NSWorkspace.shared.open(URL(string: "https://github.com/havurgiray/kurzschrift")!) }
+        }
+      }
+    } header: {
+      Text("About")
+    }
+  }
+
+  @ViewBuilder private var status: some View {
+    switch updates.state {
+    case .idle:
+      if let last = updates.lastChecked {
+        Text("Checked \(last.formatted(date: .abbreviated, time: .shortened))").foregroundStyle(.secondary)
+      }
+    case .checking: ProgressView().controlSize(.small)
+    case .upToDate: Label("Up to date", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+    case .available(let version, let page):
+      Button("Get \(version)…") { NSWorkspace.shared.open(page) }
+    case .failed(let message):
+      Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).lineLimit(2)
+    }
+  }
+
+  /// The notices ship inside the app; a development build without them opens the copy on GitHub.
+  private func openBundled(_ name: String, fallback: String) {
+    if let url = Bundle.main.url(forResource: name, withExtension: "txt") {
+      NSWorkspace.shared.open(url)
+    } else {
+      NSWorkspace.shared.open(URL(string: "https://github.com/havurgiray/kurzschrift/blob/main/\(fallback)")!)
+    }
+  }
+}
+
 /// Remembered voices: people named in earlier meetings get their names automatically.
 private struct VoicesSection: View {
   @ObservedObject var settings: AppSettings
@@ -124,6 +215,9 @@ private struct VoicesSection: View {
 
   var body: some View {
     Section {
+      TextField("Your name", text: $settings.myName, prompt: Text("Me"))
+      Text("Used as the speaker name for your microphone.")
+        .font(.caption).foregroundStyle(.secondary)
       Toggle("Recognize people I've named before", isOn: $settings.recognizeVoices)
       if voices.isEmpty {
         Text("After a meeting, click a speaker's name in the meeting window to rename them and remember their voice.")
@@ -158,6 +252,8 @@ private struct MeetingsSettings: View {
         }
         Text("Stops and saves a recording nobody has spoken in for that long, e.g. one left running after a call.")
           .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Silence")
       }
       Section {
         Toggle("Offer to record when a call starts", isOn: $settings.detectCalls)
@@ -167,16 +263,28 @@ private struct MeetingsSettings: View {
           .disabled(!settings.detectCalls)
         Text("Watches which apps use the microphone (Teams, Zoom, Webex, FaceTime, Slack, Discord). It sees app names only, never audio.")
           .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Calls")
       }
       Section {
         Toggle("Name transcripts after the current calendar event", isOn: $settings.useCalendar)
         Text("Uses the event's title for the file and gives its attendee list to the minutes. Read on this Mac only.")
           .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Calendar")
       }
       Section {
         Toggle("Global shortcuts", isOn: $settings.globalShortcuts)
         Text(HotKeys.shared.shortcuts.map { "\($0.display) \(Self.shortcutName($0.id))" }.joined(separator: "   ·   "))
           .font(.caption).foregroundStyle(.secondary)
+      } header: {
+        Text("Shortcuts")
+      }
+      Section {
+        Text("Recording other people may need their consent where you live. Let the people in your meetings know that you transcribe them.")
+          .font(.callout).foregroundStyle(.secondary)
+      } header: {
+        Text("Recording other people")
       }
     }
     .formStyle(.grouped)
@@ -254,11 +362,29 @@ private struct TranscriptionSettings: View {
         Toggle("Include my microphone", isOn: $settings.transcribeIncludeMic)
         Toggle("Identify speakers (Speaker 1, Speaker 2, …)", isOn: $settings.transcribeSeparateSpeakers)
       }
+      Section {
+        Toggle("Second menu entry in the language of Translate Meeting", isOn: $settings.transcribeSecondEntry)
+        Text(secondEntryNote)
+          .font(.caption).foregroundStyle(.secondary)
+      }
     }
     .formStyle(.grouped)
     .task {
       speechLocales = await SpeechTranscriber.supportedLocales.map { $0.identifier(.bcp47) }.sorted()
     }
+  }
+}
+
+extension TranscriptionSettings {
+  /// Says what the second entry is right now, or why there is none.
+  fileprivate var secondEntryNote: String {
+    if let title = settings.secondTranscribeTitle {
+      return "The menu also offers “\(title)”: the languages set under Translate, written down without translating. Microphone and speaker settings are the ones above."
+    }
+    if settings.transcribeSecondEntry {
+      return "Nothing to add right now: Translate Meeting and Transcribe Meeting use the same language."
+    }
+    return "Adds a second Transcribe Meeting entry to the menu for the languages set under Translate, written down without translating."
   }
 }
 
@@ -275,13 +401,13 @@ private struct MinutesSettings: View {
   var body: some View {
     Form {
       Section {
-        Toggle("Translate meetings", isOn: $settings.minutesForTranslate)
-        Toggle("Transcribe meetings", isOn: $settings.minutesForTranscribe)
+        Toggle("Write minutes in Translate meetings", isOn: $settings.minutesForTranslate)
+        Toggle("Write minutes in Transcribe meetings", isOn: $settings.minutesForTranscribe)
         Picker("Update every", selection: $settings.minutesIntervalMinutes) {
           ForEach(AppSettings.minutesIntervalChoices, id: \.self) { Text("\($0) min").tag($0) }
         }
         Text(
-          "While a meeting runs, the transcript is sent to \(settings.provider.displayName) to keep the minutes up to date, and once more at the end for the final minutes, which go into the transcript file. Everything else stays on this Mac."
+          "While a meeting runs, the transcript is sent to \(settings.provider.displayName) to keep the minutes up to date, and once more at the end for the final minutes, which go into the transcript file. Everything else stays on this Mac. Switching minutes off also stops them for a meeting in progress; switching them on, the provider, the model and the prompt apply from the next meeting."
         )
         .font(.caption).foregroundStyle(.secondary)
       } header: {

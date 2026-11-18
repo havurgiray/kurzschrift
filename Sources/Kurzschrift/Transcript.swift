@@ -27,7 +27,7 @@ enum TranscriptBuilder {
   /// turns and the name each diarized speaker ended up with ("source:speakerId" → "Speaker 2" or "Maria").
   static func build(
     segments: [FinalSegment], speakers: [AudioSourceKind: [SpeakerSpan]], config: SessionConfig,
-    knownNames: [String: String], sameSpeakers: [String: String] = [:]
+    knownNames: [String: String], sameSpeakers: [String: String] = [:], bookmarks: [Double] = []
   ) -> (turns: [Turn], speakerNames: [String: String]) {
     let segments = removingEcho(segments.sorted { $0.start < $1.start })
     let bothSources = Set(segments.map(\.source)).count > 1 || config.includeMic
@@ -77,11 +77,18 @@ enum TranscriptBuilder {
       }
     }
 
-    // 3. Merge consecutive pieces from the same speaker.
+    // 3. Merge consecutive pieces from the same speaker. A bookmark starts a new turn, so it sits
+    // where it was set instead of after a long turn. Without speaker names ("Others", or no label
+    // at all) nothing else would ever end a turn but a 30 s pause, and a meeting would be one
+    // paragraph: there a new one starts after about 90 s of speech.
     var turns: [Turn] = []
     for p in pieces where !p.text.isEmpty {
       let name = p.label.map { names[$0] ?? $0 }
-      if var last = turns.last, last.speaker == name, p.start - last.end < 30 {
+      let unlabelled = name == nil || name == "Others"
+      if var last = turns.last, last.speaker == name, p.start - last.end < 30,
+        !(unlabelled && p.start - last.start >= Self.unlabelledParagraphSeconds),
+        !bookmarks.contains(where: { last.start < $0 && $0 <= p.start })
+      {
         last.pieces.append(p.text)
         last.languages.append(p.language)
         last.end = max(last.end, p.end)
@@ -95,6 +102,9 @@ enum TranscriptBuilder {
 
   /// Speech that speaker detection didn't cover (very quiet or very short).
   private static let unknownSpeaker = "?"
+
+  /// How long a paragraph of a transcript without speaker names gets before a new one starts.
+  static let unlabelledParagraphSeconds = 90.0
 
   private static func piece(_ label: String?, _ words: [TimedWord], _ language: String)
     -> (label: String?, start: Double, end: Double, text: String, language: String)
@@ -227,7 +237,12 @@ final class TranscriptDocument {
   lazy var usesAIMinutes = config.minutes != nil
   private var minutesHeading: String { usesAIMinutes ? "Minutes" : "Notes" }
 
-  func writeDraft(entries: [SessionController.LiveEntry], minutes: String? = nil) {
+  /// Why the last write failed; nil after one that worked.
+  private(set) var writeError: String?
+
+  /// Returns false when the file couldn't be written (`writeError` says why).
+  @discardableResult
+  func writeDraft(entries: [SessionController.LiveEntry], minutes: String? = nil) -> Bool {
     write(draftMarkdown(entries: entries, minutes: minutes))
   }
 
@@ -254,10 +269,12 @@ final class TranscriptDocument {
     return md
   }
 
+  /// Returns false when the file couldn't be written (`writeError` says why).
+  @discardableResult
   func writeFinal(
     turns: [Turn], endedAt: Date, notes: [String], audioFiles: [URL], minutes: String? = nil, bookmarks: [Double] = [],
     qa: [(question: String, answer: String)] = []
-  ) {
+  ) -> Bool {
     var pending = bookmarks.sorted()
     /// Bookmarks that fall before `time` and haven't been written yet.
     func marks(before time: Double) -> String {
@@ -271,7 +288,11 @@ final class TranscriptDocument {
     let speakers = turns.compactMap(\.speaker).filter { $0 != "Unknown speaker" }
       .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
     var md = header(endedAt: endedAt, speakers: speakers)
-    for note in notes { md += "> [!note]\n> \(note)\n\n" }
+    for note in notes {
+      // Every line of a note (an error can come with several) stays inside the callout.
+      let lines = note.split(whereSeparator: \.isNewline).map { "> \($0)" }
+      md += "> [!note]\n" + lines.joined(separator: "\n") + "\n\n"
+    }
     if !audioFiles.isEmpty {
       md += "Audio: " + audioFiles.map { "[\($0.lastPathComponent)](<\($0.lastPathComponent)>)" }.joined(separator: ", ") + "\n\n"
     }
@@ -305,7 +326,7 @@ final class TranscriptDocument {
       for turn in turns { md += heading(turn.speaker, turn.start) + "\(turn.translation ?? "_(not translated)_")\n\n" }
     }
     md += marks(before: .infinity)
-    write(md)
+    return write(md)
   }
 
   // MARK: Formatting
@@ -329,22 +350,30 @@ final class TranscriptDocument {
       front += "translation: \(target.minimalIdentifier)\n"
     }
     if !speakers.isEmpty {
-      front += "speakers: [" + speakers.map { "\"\($0)\"" }.joined(separator: ", ") + "]\n"
+      front += "speakers: [" + speakers.map(Self.yamlString).joined(separator: ", ") + "]\n"
     }
     if let event = config.eventTitle {
-      front += "event: \"\(event.replacingOccurrences(of: "\"", with: "'"))\"\n"
+      front += "event: \(Self.yamlString(event))\n"
     }
     if !config.attendees.isEmpty {
-      front += "attendees: [" + config.attendees.map { "\"\($0)\"" }.joined(separator: ", ") + "]\n"
+      front += "attendees: [" + config.attendees.map(Self.yamlString).joined(separator: ", ") + "]\n"
     }
     let participants = context.names
     if !participants.isEmpty {
-      front += "participants: ["
-        + participants.map { "\"\($0.replacingOccurrences(of: "\"", with: "'"))\"" }.joined(separator: ", ") + "]\n"
+      front += "participants: [" + participants.map(Self.yamlString).joined(separator: ", ") + "]\n"
     }
     front += "---\n\n"
     let title = "# \(Self.kindTitle(config)), \(Self.titleDate.string(from: startedAt))\n\n"
     return front + title
+  }
+
+  /// A name or title as a double-quoted YAML string: a quote in it becomes an apostrophe (as event
+  /// titles always were written), a backslash is escaped, and a line break becomes a space.
+  static func yamlString(_ text: String) -> String {
+    let flat = text.split(whereSeparator: \.isNewline).joined(separator: " ")
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "'")
+    return "\"\(flat)\""
   }
 
   private func heading(_ speaker: String?, _ seconds: Double) -> String {
@@ -352,11 +381,15 @@ final class TranscriptDocument {
     return speaker.map { "**\($0)** · \(time)\n\n" } ?? "**\(time)**\n\n"
   }
 
-  private func write(_ text: String) {
+  private func write(_ text: String) -> Bool {
     do {
       try text.write(to: url, atomically: true, encoding: .utf8)
+      writeError = nil
+      return true
     } catch {
       Log.write("writing transcript failed: \(error)")
+      writeError = error.localizedDescription
+      return false
     }
   }
 
@@ -383,8 +416,10 @@ final class TranscriptDocument {
     }
   }
 
-  private static let fileStamp: DateFormatter = {
+  static let fileStamp: DateFormatter = {
     let f = DateFormatter()
+    // Fixed format: without this locale a 12-hour clock setting or another calendar changes it.
+    f.locale = Locale(identifier: "en_US_POSIX")
     f.dateFormat = "yyyy-MM-dd HH-mm"
     return f
   }()

@@ -31,11 +31,15 @@ enum VoiceLibrary {
     }
   }
 
-  /// Adds or refines a named voice (running average of its embeddings).
-  static func remember(_ name: String, embedding: [Float]) {
+  /// Adds or refines a named voice (running average of its embeddings). Returns the entry as it
+  /// was before (nil when the name is new), so `restore` can take this back.
+  @discardableResult
+  static func remember(_ name: String, embedding: [Float]) -> Voice? {
     var voices = all()
     let new = normalized(embedding)
+    var previous: Voice?
     if let i = voices.firstIndex(where: { $0.name == name }) {
+      previous = voices[i]
       let n = Float(voices[i].meetings)
       voices[i].embedding = normalized(zip(voices[i].embedding, new).map { ($0 * n + $1) / (n + 1) })
       voices[i].meetings += 1
@@ -44,6 +48,16 @@ enum VoiceLibrary {
     }
     save(voices)
     Log.write("voice remembered (\(voices.count) known)")
+    return previous
+  }
+
+  /// Takes a `remember` back, when the name it was given turns out to be wrong: the entry goes
+  /// back to what it was before, or away if that meeting was all there was to it.
+  static func restore(_ name: String, to previous: Voice?) {
+    var voices = all().filter { $0.name != name }
+    if let previous { voices.append(previous) }
+    save(voices)
+    Log.write("voice taken back (\(voices.count) known)")
   }
 
   static func forget(_ name: String) {

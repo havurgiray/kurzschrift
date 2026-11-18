@@ -34,7 +34,11 @@ enum Reprocess {
     config.includeMic = files.count > 1
     config.keepAudio = false
     if let out = value("--out") { config.saveFolder = URL(fileURLWithPath: out) }
-    if let language = value("--language") { config.spokenLocale = Locale(identifier: language) }
+    if let language = value("--language") {
+      config.spokenLocale = Locale(identifier: language)
+      // The minutes of a transcribed meeting are written in its language.
+      if mode == .transcribe { config.minutes = AppSettings.shared.minutesConfig(for: mode, spoken: language) }
+    }
     if let also = value("--also") { config.secondLocale = also == "none" ? nil : Locale(identifier: also) }
     let startedAt = value("--start").flatMap { ISO8601DateFormatter().date(from: $0) }
 
@@ -53,6 +57,15 @@ enum Reprocess {
 
   @MainActor
   private static func run(files: [(AudioSourceKind, URL)], config: SessionConfig, startedAt: Date?) async throws -> URL {
+    // A WAV from a meeting that was never saved (the app died) has no lengths in its header.
+    for (_, url) in files where url.pathExtension.lowercased() == "wav" && WAVRepair.needsRepair(url) {
+      do {
+        try WAVRepair.repair(url)
+        FileHandle.standardError.write(Data("\(url.lastPathComponent): unfinished WAV header repaired\n".utf8))
+      } catch {
+        FileHandle.standardError.write(Data("\(url.lastPathComponent): unfinished WAV header, not repaired: \(error)\n".utf8))
+      }
+    }
     let locale = try await SpeechPipeline.prepareModel(for: config.spokenLocale)
     var secondLocale: Locale?
     if let wanted = config.secondLocale, !LanguageArbiter.sameLanguage(wanted.identifier, locale.identifier) {
@@ -83,6 +96,9 @@ enum Reprocess {
         second = extra
       }
       let file = try AVAudioFile(forReading: url, commonFormat: .pcmFormatInt16, interleaved: true)
+      if file.length == 0 {
+        FileHandle.standardError.write(Data("\(url.lastPathComponent): no audio in this file\n".utf8))
+      }
       let rate = file.processingFormat.sampleRate
       let hours = Double(file.length) / rate / 3600
       while file.framePosition < file.length {
@@ -206,7 +222,8 @@ enum Reprocess {
       let client = MinutesClient(provider: minutesConfig.provider, model: minutesConfig.model, apiKey: minutesConfig.apiKey)
       do {
         let result = try await client.minutes(
-          transcriptChunks: [transcript], previousMinutes: nil, config: minutesConfig, final: true, longCache: false)
+          transcriptChunks: [transcript], previousMinutes: nil, config: minutesConfig, final: true, longCache: false,
+          cacheTranscript: false)
         minutes = result.text
         FileHandle.standardError.write(Data("minutes: \(minutesConfig.model), in=\(result.usage.input) out=\(result.usage.output)\n".utf8))
       } catch {

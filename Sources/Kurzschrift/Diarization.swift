@@ -29,10 +29,12 @@ enum Diarization {
     let voices: [String: [Float]]
   }
 
-  static func speakers(in wav: URL) async throws -> Result {
+  /// `timeout` (seconds) ends a helper that hangs, so a meeting can't be stuck in "Identifying
+  /// speakers…" for good; the transcript is then saved without speaker names.
+  static func speakers(in wav: URL, timeout: TimeInterval? = nil) async throws -> Result {
     let output = wav.deletingPathExtension().appendingPathExtension("speakers.json")
     let voicesFile = voicesURL(for: output)
-    try await runHelper([diarizeFlag, wav.path, output.path])
+    try await runHelper([diarizeFlag, wav.path, output.path], timeout: timeout)
     defer {
       try? FileManager.default.removeItem(at: output)
       try? FileManager.default.removeItem(at: voicesFile)
@@ -123,7 +125,21 @@ enum Diarization {
     return result
   }
 
-  private static func runHelper(_ arguments: [String]) async throws {
+  /// How long speaker detection may take for a recording of `duration` seconds before it counts
+  /// as hung. It needs about 2% of the recording's length on an M-series Mac (16 s for 17
+  /// minutes), plus loading the models and, the first time, downloading them (21 MB).
+  static func timeout(forAudioSeconds duration: Double) -> TimeInterval {
+    180 + duration / 4
+  }
+
+  private final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func set() { lock.withLock { value = true } }
+    var isSet: Bool { lock.withLock { value } }
+  }
+
+  private static func runHelper(_ arguments: [String], timeout: TimeInterval? = nil) async throws {
     guard let executable = Bundle.main.executableURL else { throw DiarizationError.noExecutable }
     let process = Process()
     process.executableURL = executable
@@ -138,16 +154,31 @@ enum Diarization {
       try? log.close()
       try? FileManager.default.removeItem(at: logURL)
     }
+    let timedOut = Flag()
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       process.terminationHandler = { p in
         if p.terminationStatus == 0 {
           continuation.resume()
+        } else if timedOut.isSet {
+          continuation.resume(throwing: DiarizationError.timedOut(Int(timeout ?? 0)))
         } else {
           let text = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
           continuation.resume(throwing: DiarizationError.helperFailed(p.terminationStatus, String(text.suffix(500))))
         }
       }
-      do { try process.run() } catch { continuation.resume(throwing: error) }
+      do {
+        try process.run()
+      } catch {
+        continuation.resume(throwing: error)
+        return
+      }
+      if let timeout {
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+          guard process.isRunning else { return }
+          timedOut.set()
+          process.terminate()
+        }
+      }
     }
   }
 
@@ -184,10 +215,12 @@ enum Diarization {
 enum DiarizationError: LocalizedError {
   case noExecutable
   case helperFailed(Int32, String)
+  case timedOut(Int)
 
   var errorDescription: String? {
     switch self {
     case .noExecutable: "Couldn't locate the app executable."
+    case .timedOut(let seconds): "Speaker detection didn't finish within \(seconds / 60) minutes and was stopped."
     case .helperFailed(let status, let log): "Speaker detection failed (exit \(status)). \(log)"
     }
   }

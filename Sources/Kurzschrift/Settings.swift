@@ -90,10 +90,23 @@ final class AppSettings: ObservableObject {
   @Published var transcribeIncludeMic: Bool { didSet { defaults.set(transcribeIncludeMic, forKey: "transcribeIncludeMic") } }
   @Published var transcribeSeparateSpeakers: Bool { didSet { defaults.set(transcribeSeparateSpeakers, forKey: "transcribeSeparateSpeakers") } }
   @Published var transcribeAlsoLocale: String { didSet { defaults.set(transcribeAlsoLocale, forKey: "transcribeAlsoLocale") } }
+  /// A second "Transcribe Meeting" entry in the menus, in the spoken language of Translate Meeting.
+  @Published var transcribeSecondEntry: Bool { didSet { defaults.set(transcribeSecondEntry, forKey: "transcribeSecondEntry") } }
 
   // Live minutes (sent to an LLM provider; off by default)
-  @Published var minutesForTranslate: Bool { didSet { defaults.set(minutesForTranslate, forKey: "minutesForTranslate") } }
-  @Published var minutesForTranscribe: Bool { didSet { defaults.set(minutesForTranscribe, forKey: "minutesForTranscribe") } }
+  @Published var minutesForTranslate: Bool {
+    didSet {
+      defaults.set(minutesForTranslate, forKey: "minutesForTranslate")
+      // Off also stops them for a meeting in progress.
+      if oldValue, !minutesForTranslate { SessionController.shared.minutesSwitchedOff(for: .translate) }
+    }
+  }
+  @Published var minutesForTranscribe: Bool {
+    didSet {
+      defaults.set(minutesForTranscribe, forKey: "minutesForTranscribe")
+      if oldValue, !minutesForTranscribe { SessionController.shared.minutesSwitchedOff(for: .transcribe) }
+    }
+  }
   @Published var minutesProvider: String { didSet { defaults.set(minutesProvider, forKey: "minutesProvider") } }
   @Published var minutesModelAnthropic: String { didSet { defaults.set(minutesModelAnthropic, forKey: "minutesModel.anthropic") } }
   @Published var minutesModelOpenAI: String { didSet { defaults.set(minutesModelOpenAI, forKey: "minutesModel.openai") } }
@@ -114,6 +127,19 @@ final class AppSettings: ObservableObject {
   /// kurzschrift:// links meant for testing (start?audio=, snapshot, edit-minutes, window).
   /// Off by default: any web page can try to open a kurzschrift:// link.
   @Published var developerLinks: Bool { didSet { defaults.set(developerLinks, forKey: "developerLinks") } }
+
+  /// kurzschrift:// links that send the transcript to the AI provider or change a saved file
+  /// (ask, minutes when it switches AI minutes on, rename). Off by default, for the same reason.
+  @Published var automationLinks: Bool { didSet { defaults.set(automationLinks, forKey: "automationLinks") } }
+
+  /// Ask GitHub once a day whether a newer release exists. Off by default: it is the one request
+  /// Kurzschrift would make by itself.
+  @Published var checkForUpdates: Bool {
+    didSet {
+      defaults.set(checkForUpdates, forKey: "checkForUpdates")
+      UpdateChecker.shared.apply(automatic: checkForUpdates)
+    }
+  }
 
   private init() {
     let d = UserDefaults.standard
@@ -147,6 +173,7 @@ final class AppSettings: ObservableObject {
       "transcribeLocale": "en-US",
       "translateAlsoLocale": "en-US",
       "transcribeAlsoLocale": "",
+      "transcribeSecondEntry": true,
       "transcribeIncludeMic": true,
       "transcribeSeparateSpeakers": true,
       "minutesForTranslate": false,
@@ -159,6 +186,8 @@ final class AppSettings: ObservableObject {
       "micDeviceUID": "",
       "micShared": false,
       "developerLinks": false,
+      "automationLinks": false,
+      "checkForUpdates": false,
     ])
     saveFolder = d.string(forKey: "saveFolder")!
     myName = d.string(forKey: "myName")!
@@ -188,6 +217,7 @@ final class AppSettings: ObservableObject {
     transcribeLocale = d.string(forKey: "transcribeLocale")!
     translateAlsoLocale = d.string(forKey: "translateAlsoLocale")!
     transcribeAlsoLocale = d.string(forKey: "transcribeAlsoLocale")!
+    transcribeSecondEntry = d.bool(forKey: "transcribeSecondEntry")
     transcribeIncludeMic = d.bool(forKey: "transcribeIncludeMic")
     transcribeSeparateSpeakers = d.bool(forKey: "transcribeSeparateSpeakers")
     minutesForTranslate = d.bool(forKey: "minutesForTranslate")
@@ -200,6 +230,8 @@ final class AppSettings: ObservableObject {
     micDeviceUID = d.string(forKey: "micDeviceUID")!
     micShared = d.bool(forKey: "micShared")
     developerLinks = d.bool(forKey: "developerLinks")
+    automationLinks = d.bool(forKey: "automationLinks")
+    checkForUpdates = d.bool(forKey: "checkForUpdates")
   }
 
   var launchAtLogin: Bool {
@@ -227,10 +259,11 @@ final class AppSettings: ObservableObject {
 
   /// nil when minutes are off for this mode, or on but missing a key or model (`minutesProblem` says which).
   /// `evenIfOff` is for switching them on by hand during or after a meeting.
-  func minutesConfig(for mode: MeetingMode, evenIfOff: Bool = false) -> MinutesConfig? {
+  /// `spoken` is the language of a transcribed meeting when it isn't the first Transcribe entry's.
+  func minutesConfig(for mode: MeetingMode, evenIfOff: Bool = false, spoken: String? = nil) -> MinutesConfig? {
     guard evenIfOff || minutesEnabled(for: mode), let key = APIKeyStore.key(for: provider), !minutesModel.isEmpty
     else { return nil }
-    let language = mode == .translate ? Self.languageName(translateTarget) : Self.languageName(transcribeLocale)
+    let language = mode == .translate ? Self.languageName(translateTarget) : Self.languageName(spoken ?? transcribeLocale)
     let context = vocabularyTerms.isEmpty
       ? "" : "Names and terms that may come up (the transcript may misspell them): " + vocabularyTerms.joined(separator: ", ")
     let prompt = minutesPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? MinutesClient.defaultPrompt : minutesPrompt
@@ -253,13 +286,31 @@ final class AppSettings: ObservableObject {
   }
 
   /// Frozen copy of the settings a session runs with, so edits mid-meeting don't half-apply.
-  func snapshot(for mode: MeetingMode) -> SessionConfig {
+  /// `secondLanguage` is the second Transcribe entry: Translate Meeting's languages, not translated.
+  func snapshot(for mode: MeetingMode, secondLanguage: Bool = false) -> SessionConfig {
     var config = baseSnapshot(for: mode)
     config.vocabulary = vocabularyTerms
     config.parakeet = parakeet
-    let also = mode == .translate ? translateAlsoLocale : transcribeAlsoLocale
+    var also = mode == .translate ? translateAlsoLocale : transcribeAlsoLocale
+    if mode == .transcribe, secondLanguage, let second = secondTranscribe {
+      config.spokenLocale = Locale(identifier: second.locale)
+      config.minutes = minutesConfig(for: mode, spoken: second.locale)
+      also = second.also
+    }
     config.secondLocale = also.isEmpty ? nil : Locale(identifier: also)
     return config
+  }
+
+  /// The second Transcribe entry's languages, or nil when it's switched off or would only repeat
+  /// the first entry.
+  var secondTranscribe: (locale: String, also: String)? {
+    guard transcribeSecondEntry, !LanguageArbiter.sameLanguage(translateSpokenLocale, transcribeLocale) else { return nil }
+    return (translateSpokenLocale, translateAlsoLocale)
+  }
+
+  /// Its title in the menus, e.g. "Transcribe Meeting (German + English)".
+  var secondTranscribeTitle: String? {
+    secondTranscribe.map { "Transcribe Meeting (\(spokenNames($0.locale, also: $0.also)))" }
   }
 
   private func baseSnapshot(for mode: MeetingMode) -> SessionConfig {

@@ -24,8 +24,9 @@ final class CallDetector: NSObject, UNUserNotificationCenterDelegate {
   private var callSince: Date?
   private var missingSince: Date?
   private var offered = false
-  /// Whether the running recording overlapped the current call (so the call's end should stop it).
-  private var recordingDuringCall = false
+  /// The recording that overlapped the current call, so the call's end stops that one and not a
+  /// recording started afterwards.
+  private var recordingDuringCall: UUID?
 
   func apply() {
     let settings = AppSettings.shared
@@ -58,14 +59,17 @@ final class CallDetector: NSObject, UNUserNotificationCenterDelegate {
     }.first
 
     if let inCall {
+      // The microphone was let go for a while and is in use again: the next call, back to back
+      // with the last one (a device switch within a call takes a second or two).
+      let nextCall = missingSince.map { Date().timeIntervalSince($0) >= 6 } ?? false
       missingSince = nil
-      if callApp != inCall {
+      if callApp != inCall || nextCall {
         callApp = inCall
         callSince = Date()
         offered = false
         Log.write("call detected: \(inCall)")
       }
-      if session.isRecording { recordingDuringCall = true }
+      if session.isRecording { recordingDuringCall = session.meetingID }
       // Offer once per call, after the microphone has been in use for a few seconds.
       if !offered, session.isIdle, let since = callSince, Date().timeIntervalSince(since) >= 3 {
         offered = true
@@ -75,13 +79,16 @@ final class CallDetector: NSObject, UNUserNotificationCenterDelegate {
       if missingSince == nil { missingSince = Date() }
       guard let missing = missingSince, Date().timeIntervalSince(missing) >= 20 else { return }
       Log.write("call ended: \(app)")
-      if recordingDuringCall, settings.stopWhenCallEnds, session.isRecording {
+      if let recording = recordingDuringCall, recording == session.meetingID, settings.stopWhenCallEnds,
+        session.isRecording
+      {
         Task { await session.stop() }
       }
       callApp = nil
       callSince = nil
       missingSince = nil
-      recordingDuringCall = false
+      offered = false
+      recordingDuringCall = nil
     }
   }
 
@@ -104,6 +111,12 @@ final class CallDetector: NSObject, UNUserNotificationCenterDelegate {
 
   nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
     let action = response.actionIdentifier
+    if response.notification.request.identifier.hasPrefix("update-") {
+      await MainActor.run {
+        _ = NSWorkspace.shared.open(UpdateChecker.shared.available?.page ?? UpdateChecker.releasesPage)
+      }
+      return
+    }
     await MainActor.run {
       let session = SessionController.shared
       switch action {

@@ -17,7 +17,20 @@ struct MeetingContext: Equatable {
 
   /// Prefilled from the calendar invite, one attendee per line.
   init(attendees: [String]) {
-    self.init(participants: attendees.joined(separator: "\n"))
+    self.init(participants: attendees.map(Self.firstNameFirst).joined(separator: "\n"))
+  }
+
+  /// "Huber, Maria" (how Exchange directories often list people) as "Maria Huber", so the comma
+  /// isn't read as two people on one line. Anything that isn't plainly a name is left alone.
+  static func firstNameFirst(_ attendee: String) -> String {
+    let parts = attendee.split(separator: ",", omittingEmptySubsequences: false)
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+    func isName(_ part: String) -> Bool {
+      !part.isEmpty && part.split(separator: " ").count <= 3
+        && part.allSatisfy { $0.isLetter || $0 == " " || $0 == "-" || $0 == "'" || $0 == "’" }
+    }
+    guard parts.count == 2, isName(parts[0]), isName(parts[1]) else { return attendee }
+    return "\(parts[1]) \(parts[0])"
   }
 
   var isEmpty: Bool { people.isEmpty && aboutText.isEmpty }

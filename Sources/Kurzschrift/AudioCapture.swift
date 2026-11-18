@@ -55,9 +55,12 @@ final class Track: @unchecked Sendable {
   /// Accepts audio in any format. Must be called from one thread at a time (each source's own).
   func receive(_ buffer: AVAudioPCMBuffer) {
     guard let converted = convert(buffer) else { return }
+    // When it arrived, not when the queue gets to it: a queue that is behind would otherwise see
+    // a gap that isn't there and pad it with silence.
+    let arrival = Date()
     queue.async { [self] in
       guard !closed else { return }
-      let arrivalSample = Int64(Date().timeIntervalSince(sessionStart) * sessionAudioFormat.sampleRate)
+      let arrivalSample = Int64(arrival.timeIntervalSince(sessionStart) * sessionAudioFormat.sampleRate)
       let gap = arrivalSample - Int64(converted.frameLength) - samplesWritten
       if gap > Int64(sessionAudioFormat.sampleRate / 2) {
         appendSilence(frames: gap)
@@ -280,6 +283,9 @@ final class MicrophoneSource {
   private let deviceUID: String
   private let engine = AVAudioEngine()
   private var configurationObserver: NSObjectProtocol?
+  private var stopped = false
+  /// Called on the main queue when the microphone couldn't be started again after a device change.
+  var onFailure: (() -> Void)?
 
   init(track: Track, deviceUID: String) {
     self.track = track
@@ -297,6 +303,7 @@ final class MicrophoneSource {
   }
 
   func stop() {
+    stopped = true
     if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
     configurationObserver = nil
     engine.stop()
@@ -321,13 +328,22 @@ final class MicrophoneSource {
     try engine.start()
   }
 
-  private func restart() {
+  /// Right after a device change the new input can still be unusable (no format yet), so a failed
+  /// restart is tried once more a moment later before giving up.
+  private func restart(retrying: Bool = false) {
+    guard !stopped else { return }
     engine.stop()
     engine.inputNode.removeTap(onBus: 0)
     do {
       try startEngine()
+      if retrying { Log.write("microphone restarted at the second try") }
     } catch {
-      Log.write("restarting microphone failed: \(error)")
+      Log.write("restarting microphone failed\(retrying ? " again" : ""): \(error)")
+      if retrying {
+        onFailure?()
+      } else {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.restart(retrying: true) }
+      }
     }
   }
 }

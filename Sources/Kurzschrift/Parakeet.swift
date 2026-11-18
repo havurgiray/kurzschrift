@@ -58,23 +58,46 @@ actor ParakeetRecognizer {
     return words
   }
 
-  /// Splits words into sentences: after . ? ! or …, or at a pause of more than 1.5 s.
+  /// Splits words into sentences: after . ? ! or … (see `endsSentence`), or at a pause of more than 1.5 s.
   static func sentences(_ words: [TimedWord]) -> [[TimedWord]] {
     var result: [[TimedWord]] = []
     var current: [TimedWord] = []
-    for word in words {
+    for (index, word) in words.enumerated() {
       if let last = current.last, word.start - last.end > 1.5 {
         result.append(current)
         current = []
       }
       current.append(word)
-      if let mark = word.text.trimmingCharacters(in: .whitespaces).last, ".?!…".contains(mark) {
+      if endsSentence(word, next: index + 1 < words.count ? words[index + 1] : nil) {
         result.append(current)
         current = []
       }
     }
     if !current.isEmpty { result.append(current) }
     return result
+  }
+
+  /// Abbreviations written with a period that are followed by more of the same sentence.
+  private static let abbreviations: Set<String> = [
+    "dr", "mr", "mrs", "ms", "prof", "nr", "ca", "bzw", "usw", "etc", "vs", "inkl", "ggf", "evtl", "jr", "sr", "vgl",
+    "sog", "mio", "mrd",
+  ]
+
+  /// Whether a sentence ends with `word`. A period doesn't always end one: "am 3. Oktober",
+  /// "at 3 p.m. tomorrow", "Dr. Huber", "z. B.". After a day-of-month number, an abbreviation or a
+  /// single letter, the sentence ends only if the speaker also pauses, and never when the next
+  /// word starts in lower case.
+  static func endsSentence(_ word: TimedWord, next: TimedWord?) -> Bool {
+    let text = word.text.trimmingCharacters(in: .whitespaces)
+    guard let mark = text.last, ".?!…".contains(mark) else { return false }
+    guard mark == ".", let next else { return true }
+    if let first = next.text.trimmingCharacters(in: .whitespaces).first, first.isLowercase { return false }
+    let stem = text.dropLast().trimmingCharacters(in: CharacterSet.alphanumerics.inverted).lowercased()
+    guard !stem.isEmpty else { return true }
+    let dayNumber = stem.count <= 2 && stem.allSatisfy(\.isNumber)
+    let singleLetter = stem.count == 1 && stem.allSatisfy(\.isLetter)
+    let ambiguous = dayNumber || singleLetter || stem.contains(".") || abbreviations.contains(stem)
+    return !ambiguous || next.start - word.end >= 0.5
   }
 
   /// The language of a sentence among the meeting's languages ("de_AT", "en_US", "en"). Short or
@@ -126,7 +149,8 @@ final class AudioHistory: @unchecked Sendable {
     let count = Int(buffer.frameLength)
     lock.withLock {
       guard enabled else { return }
-      samples.reserveCapacity(samples.count + count)
+      // No reserveCapacity here: asking for the exact size on every call makes the array reallocate
+      // and copy all of its audio each time instead of growing geometrically.
       for i in 0..<count { samples.append(Float(data[i]) / 32768) }
     }
   }

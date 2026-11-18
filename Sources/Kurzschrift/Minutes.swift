@@ -53,10 +53,27 @@ enum APIKeyStore {
   static let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("Kurzschrift/api-keys.json")
 
+  /// The decoded file, so asking for a key (the meeting window does on every update) doesn't read
+  /// and decode it each time. Read again when Settings saves a key or the file's date changes.
+  private final class Cache: @unchecked Sendable {
+    let lock = NSLock()
+    var loaded = false
+    var modified: Date?
+    var keys: [String: String] = [:]
+  }
+  private static let cache = Cache()
+
   static func key(for provider: MinutesProvider) -> String? {
-    guard let data = try? Data(contentsOf: url),
-      let keys = try? JSONDecoder().decode([String: String].self, from: data),
-      let key = keys[provider.rawValue]?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty
+    let modified = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    let keys: [String: String] = cache.lock.withLock {
+      if cache.loaded, cache.modified == modified { return cache.keys }
+      let data = try? Data(contentsOf: url)
+      cache.keys = data.flatMap { try? JSONDecoder().decode([String: String].self, from: $0) } ?? [:]
+      cache.modified = modified
+      cache.loaded = true
+      return cache.keys
+    }
+    guard let key = keys[provider.rawValue]?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty
     else { return nil }
     return key
   }
@@ -72,6 +89,7 @@ enum APIKeyStore {
     } catch {
       Log.write("saving API key failed: \(error)")
     }
+    cache.lock.withLock { cache.loaded = false }
   }
 }
 
@@ -110,7 +128,7 @@ struct MinutesUsage: Equatable {
   func estimatedCost(model: String, longCache: Bool) -> Double? {
     let prices: [String: (input: Double, output: Double, cacheRead: Double)] = [
       "claude-opus-5-5": (4, 20, 0.20),
-      "claude-sonnet-5-5": (2, 10, 0.20),
+      "claude-sonnet-5-5": (2, 10, 0.10),
       "claude-haiku-5-5": (0.10, 0.50, 0.01),
     ]
     guard let p = prices[model] else { return nil }
@@ -127,6 +145,8 @@ enum MinutesError: LocalizedError {
   case http(Int, String)
   case refused(String?)
   case emptyResponse
+  /// The answer stopped at the output limit, so it is incomplete.
+  case truncated
   case network(String)
 
   var errorDescription: String? {
@@ -139,6 +159,7 @@ enum MinutesError: LocalizedError {
     case .http(let status, let message): "HTTP \(status): \(message)"
     case .refused(let category): "The model declined to write minutes\(category.map { " (\($0))" } ?? "")."
     case .emptyResponse: "The model returned no text."
+    case .truncated: "The model's answer was cut off at its length limit, so it is incomplete."
     case .network(let message): "Network error: \(message)"
     }
   }
@@ -167,14 +188,17 @@ final class MinutesClient: @unchecked Sendable {
 
   /// `transcriptChunks` only ever grows at the end, so the provider can cache everything but the
   /// newest chunk; the previous minutes and the request come after the cached part.
+  /// `cacheTranscript` is false for a transcript that is sent once (the final minutes): writing
+  /// it to the provider's cache costs extra and nothing would read it back.
   func minutes(
     transcriptChunks: [String], previousMinutes: String?, edits: [MinutesEdit] = [], config: MinutesConfig,
-    final: Bool, longCache: Bool
+    final: Bool, longCache: Bool, cacheTranscript: Bool = true
   ) async throws -> (text: String, usage: MinutesUsage) {
     let system = Self.systemPrompt(prompt: config.prompt, language: config.language, context: config.context)
     let tail = Self.requestText(previousMinutes: previousMinutes, edits: edits, final: final)
     return try await sendWithRetry(
-      system: system, chunks: transcriptChunks, tail: tail, effort: final ? "medium" : "low", longCache: longCache)
+      system: system, chunks: transcriptChunks, tail: tail, effort: final ? "medium" : "low", longCache: longCache,
+      cache: cacheTranscript)
   }
 
   /// Answers a question about the meeting from its transcript (the "Ask" tab). `context` is what
@@ -189,18 +213,19 @@ final class MinutesClient: @unchecked Sendable {
       guessing.
       """
     if !context.isEmpty { system += "\n\n\(context)" }
+    // Cached: after a meeting, several questions in a row read the same transcript.
     return try await sendWithRetry(
-      system: system, chunks: [transcript], tail: "Question: \(question)", effort: "low", longCache: false)
+      system: system, chunks: [transcript], tail: "Question: \(question)", effort: "low", longCache: false, cache: true)
   }
 
-  private func sendWithRetry(system: String, chunks: [String], tail: String, effort: String, longCache: Bool)
-    async throws -> (text: String, usage: MinutesUsage)
-  {
+  private func sendWithRetry(
+    system: String, chunks: [String], tail: String, effort: String, longCache: Bool, cache: Bool
+  ) async throws -> (text: String, usage: MinutesUsage) {
     do {
-      return try await send(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
+      return try await send(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache, cache: cache)
     } catch let error as MinutesError where error.isRetryable {
       try await Task.sleep(for: .seconds(3))
-      return try await send(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
+      return try await send(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache, cache: cache)
     }
   }
 
@@ -231,22 +256,23 @@ final class MinutesClient: @unchecked Sendable {
 
   // MARK: Requests
 
-  private func send(system: String, chunks: [String], tail: String, effort: String, longCache: Bool) async throws
-    -> (text: String, usage: MinutesUsage)
-  {
+  private func send(
+    system: String, chunks: [String], tail: String, effort: String, longCache: Bool, cache: Bool
+  ) async throws -> (text: String, usage: MinutesUsage) {
     switch provider {
-    case .anthropic: try await sendAnthropic(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
+    case .anthropic:
+      try await sendAnthropic(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache, cache: cache)
     case .openai: try await sendOpenAI(system: system, chunks: chunks, tail: tail)
     }
   }
 
-  private func sendAnthropic(system: String, chunks: [String], tail: String, effort: String, longCache: Bool)
-    async throws -> (text: String, usage: MinutesUsage)
-  {
+  private func sendAnthropic(
+    system: String, chunks: [String], tail: String, effort: String, longCache: Bool, cache: Bool
+  ) async throws -> (text: String, usage: MinutesUsage) {
     var content: [[String: Any]] = [["type": "text", "text": Self.transcriptIntro]]
     for (i, chunk) in chunks.enumerated() {
       var block: [String: Any] = ["type": "text", "text": chunk]
-      if i == chunks.count - 1 {
+      if cache, i == chunks.count - 1 {
         block["cache_control"] = longCache ? ["type": "ephemeral", "ttl": "1h"] : ["type": "ephemeral"]
       }
       content.append(block)
@@ -280,12 +306,14 @@ final class MinutesClient: @unchecked Sendable {
     } catch MinutesError.http(400, let message) where useFallbacks && message.contains("fallback") {
       // The account doesn't have the fallback beta: carry on without it.
       fallbacksRejected = true
-      return try await sendAnthropic(system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache)
+      return try await sendAnthropic(
+        system: system, chunks: chunks, tail: tail, effort: effort, longCache: longCache, cache: cache)
     }
 
     if json["stop_reason"] as? String == "refusal" {
       throw MinutesError.refused((json["stop_details"] as? [String: Any])?["category"] as? String)
     }
+    if json["stop_reason"] as? String == "max_tokens" { throw MinutesError.truncated }
     let text = ((json["content"] as? [[String: Any]]) ?? [])
       .filter { $0["type"] as? String == "text" }
       .compactMap { $0["text"] as? String }
@@ -316,8 +344,10 @@ final class MinutesClient: @unchecked Sendable {
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
     let json = try await perform(request)
-    let message = ((json["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any]) ?? [:]
+    let choice = (json["choices"] as? [[String: Any]])?.first ?? [:]
+    let message = (choice["message"] as? [String: Any]) ?? [:]
     if let refusal = message["refusal"] as? String, !refusal.isEmpty { throw MinutesError.refused(nil) }
+    if choice["finish_reason"] as? String == "length" { throw MinutesError.truncated }
     let text = (message["content"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { throw MinutesError.emptyResponse }
     let u = json["usage"] as? [String: Any] ?? [:]
@@ -358,7 +388,7 @@ final class MinutesClient: @unchecked Sendable {
 
   /// Server-side refusal fallback (`fallbacks: "default"`) is offered on these models.
   private static func supportsFallbacks(_ model: String) -> Bool {
-    ["claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"].contains(model)
+    ["claude-opus-5-5", "claude-opus-5", "claude-fable-5-2", "claude-fable-5-1", "claude-sonnet-5-5"].contains(model)
   }
 
   // MARK: Prompt
@@ -489,6 +519,11 @@ final class MinutesRunner {
   private var deferred = false
   /// A response that arrived while you were editing; used if you end up changing nothing.
   private var held: String?
+  /// The final minutes are being written or done: no live update starts any more, and one still
+  /// on its way doesn't replace them.
+  private var finalizing = false
+  /// Switched off for good (`discard`): nothing more is sent or published.
+  private var discarded = false
 
   /// Seconds between updates; follows "Update every" in Settings, even mid-meeting.
   private(set) var interval: TimeInterval
@@ -536,7 +571,19 @@ final class MinutesRunner {
     loop?.cancel()
     loop = nil
     state.nextUpdate = nil
-    publish(state)
+    send()
+  }
+
+  /// Minutes were switched off for the meeting in progress: no more updates and no final minutes.
+  /// An answer still on its way is ignored.
+  func discard() {
+    loop?.cancel()
+    loop = nil
+    discarded = true
+  }
+
+  private func send() {
+    if !discarded { publish(state) }
   }
 
   func add(line: String) {
@@ -564,7 +611,7 @@ final class MinutesRunner {
       held = nil
       state.text = text
       state.editsPending = true
-      publish(state)
+      send()
       Log.write("minutes edited: \(edit.removed.count) lines removed, \(edit.added.count) added")
     } else {
       applyHeld()
@@ -583,7 +630,7 @@ final class MinutesRunner {
     self.held = nil
     state.text = held
     state.updatedAt = Date()
-    publish(state)
+    send()
   }
 
   private func runIfDeferred() {
@@ -596,10 +643,11 @@ final class MinutesRunner {
 
   private func schedule() {
     state.nextUpdate = Date().addingTimeInterval(interval)
-    publish(state)
+    send()
   }
 
   private func update() async {
+    guard !finalizing, !discarded else { return }
     if editing {
       deferred = true
       return
@@ -618,7 +666,7 @@ final class MinutesRunner {
 
     inFlight = true
     state.isUpdating = true
-    publish(state)
+    send()
     let sentRevision = revision
     var rerun = false
     do {
@@ -627,25 +675,30 @@ final class MinutesRunner {
         config: requestConfig, final: false, longCache: longCache)
       state.usage = state.usage + result.usage
       state.cost = state.usage.estimatedCost(model: config.model, longCache: longCache)
-      state.error = nil
       Log.write("minutes updated: \(chunks.count) chunks, \(edits.count) edits, usage in=\(result.usage.input) cached=\(result.usage.cacheRead) written=\(result.usage.cacheWrite) out=\(result.usage.output)")
-      if revision != sentRevision {
+      if finalizing {
+        // The meeting has ended meanwhile: the final minutes take it from here.
+      } else if revision != sentRevision {
         // You edited while this ran; redo it from your version.
+        state.error = nil
         rerun = true
       } else if editing {
+        state.error = nil
         held = result.text
       } else {
+        state.error = nil
         state.text = result.text
         state.editsPending = false
         state.updatedAt = Date()
       }
     } catch {
-      state.error = error.localizedDescription
+      if !finalizing { state.error = error.localizedDescription }
       Log.write("minutes update failed: \(error)")
     }
     inFlight = false
-    state.isUpdating = false
-    publish(state)
+    // While the final minutes are being written, their request owns the progress indicator.
+    if !finalizing { state.isUpdating = false }
+    send()
     if rerun { await update() }
   }
 
@@ -653,17 +706,18 @@ final class MinutesRunner {
   /// draft and keeping your edits.
   func finalize(transcript: String) async -> String? {
     stop()
-    guard !transcript.isEmpty else { return nil }
+    finalizing = true
+    guard !transcript.isEmpty, !discarded else { return nil }
     state.isUpdating = true
-    publish(state)
+    send()
     defer {
       state.isUpdating = false
-      publish(state)
+      send()
     }
     do {
       let result = try await client.minutes(
         transcriptChunks: [transcript], previousMinutes: state.text.isEmpty ? nil : state.text, edits: edits,
-        config: requestConfig, final: true, longCache: false)
+        config: requestConfig, final: true, longCache: false, cacheTranscript: false)
       state.text = result.text
       state.editsPending = false
       state.updatedAt = Date()

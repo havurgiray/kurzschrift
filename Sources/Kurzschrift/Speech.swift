@@ -127,7 +127,11 @@ final class SpeechPipeline: @unchecked Sendable {
       attributeOptions: [.audioTimeRange, .transcriptionConfidence])
   }
 
-  func start(onEvent: @escaping @Sendable (SpeechEvent) async -> Void) {
+  /// `onFailure` is told when the results end with an error instead of at the end of the input:
+  /// nothing more is recognized from this source after that.
+  func start(
+    onEvent: @escaping @Sendable (SpeechEvent) async -> Void, onFailure: (@Sendable (Error) async -> Void)? = nil
+  ) {
     let source = source
     let transcriber = transcriber
     let localeID = locale.identifier
@@ -151,6 +155,7 @@ final class SpeechPipeline: @unchecked Sendable {
         }
       } catch {
         Log.write("\(source) speech recognition ended: \(error)")
+        await onFailure?(error)
       }
     }
   }

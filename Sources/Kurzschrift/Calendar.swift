@@ -56,13 +56,27 @@ enum CalendarContext {
       let line = raw.trimmingCharacters(in: .whitespaces)
       guard line.hasPrefix("- [ ] ") || line.hasPrefix("* [ ] ") else { return nil }
       let body = String(line.dropFirst(6)).replacingOccurrences(of: "**", with: "")
-      if let colon = body.firstIndex(of: ":"), body.distance(from: body.startIndex, to: colon) <= 40 {
+      if let colon = ownerColon(in: body) {
         let owner = body[..<colon].trimmingCharacters(in: .whitespaces)
         let task = body[body.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         return ActionItem(line: body, owner: owner == "?" ? nil : owner, task: task)
       }
       return ActionItem(line: body, owner: nil, task: body)
     }
+  }
+
+  /// The colon after the owner in "Owner: task": within the first 40 characters, and not the one
+  /// in a time ("Call at 10:30") or a link ("https://…").
+  static func ownerColon(in body: String) -> String.Index? {
+    for index in body.indices.prefix(41) where body[index] == ":" {
+      let before = index > body.startIndex ? body[body.index(before: index)] : " "
+      let afterIndex = body.index(after: index)
+      let after: Character = afterIndex < body.endIndex ? body[afterIndex] : " "
+      if before.isNumber && after.isNumber { continue }
+      if after == "/" { continue }
+      return index
+    }
+    return nil
   }
 
   /// Adds the items to the default Reminders list. Returns the list's name.
