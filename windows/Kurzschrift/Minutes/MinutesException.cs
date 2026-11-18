@@ -6,6 +6,7 @@ public enum MinutesErrorKind {
   Refused,
   EmptyResponse,
   Network,
+  Truncated,
 }
 
 /// What went wrong writing minutes or answering a question. `Message` is the text for the pane.
@@ -42,6 +43,11 @@ public sealed class MinutesException : Exception {
   public static MinutesException EmptyResponse() =>
     new(MinutesErrorKind.EmptyResponse, 0, null, "The model returned no text.");
 
+  /// The answer was cut off at the output limit (Anthropic: stop_reason max_tokens; OpenAI:
+  /// finish_reason length), so it isn't the complete minutes.
+  public static MinutesException Truncated() =>
+    new(MinutesErrorKind.Truncated, 0, null, "The model's answer was cut off before it was complete.");
+
   public static MinutesException Network(string message) =>
     new(MinutesErrorKind.Network, 0, message, $"Network error: {message}");
 
@@ -57,6 +63,7 @@ public sealed class MinutesException : Exception {
     MinutesErrorKind.Http => $"http({Status}, \"{Detail}\")",
     MinutesErrorKind.Refused => $"refused({(Detail == null ? "nil" : $"\"{Detail}\"")})",
     MinutesErrorKind.EmptyResponse => "emptyResponse",
+    MinutesErrorKind.Truncated => "truncated",
     _ => $"network(\"{Detail}\")",
   };
 

@@ -19,7 +19,7 @@ public sealed class FinalSegment {
 
 /// Silero VAD for one track: cuts the stream into utterances (finals). While someone is speaking it
 /// also hands out the utterance so far every few seconds, for provisional text.
-public sealed class VadSegmenter {
+public sealed class VadSegmenter : IDisposable {
   readonly VoiceActivityDetector vad;
   readonly int window;
   readonly List<float> pending = new();
@@ -80,6 +80,9 @@ public sealed class VadSegmenter {
     Drain();
   }
 
+  /// Only once nothing feeds it any more (its track is closed).
+  public void Dispose() => vad.Dispose();
+
   void Drain() {
     while (!vad.IsEmpty()) {
       var s = vad.Front();
@@ -127,10 +130,12 @@ public sealed class Recognizer : IDisposable {
       double t0 = offset + times[i];
       double t1 = i < durations.Length && durations[i] > 0 ? t0 + durations[i]
         : i + 1 < times.Length ? offset + times[i + 1] : t0 + 0.2;
-      bool startsWord = tok.StartsWith('▁') || text == null;
+      // sherpa-onnx hands the tokens out with the word marker already turned into a space
+      // (" G", "uten", " Mor", "gen", ","; seen in the log on 2026-11-18); "▁" is the marker in tokens.txt.
+      bool startsWord = tok.StartsWith(' ') || tok.StartsWith('▁') || text == null;
       if (startsWord && text != null) words.Add(new TimedWord(text, start, end));
       if (startsWord) {
-        text = " " + tok.TrimStart('▁');
+        text = " " + tok.TrimStart(' ', '▁');
         start = t0;
       } else {
         text += tok;

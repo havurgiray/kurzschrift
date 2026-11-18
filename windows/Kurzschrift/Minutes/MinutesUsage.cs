@@ -9,7 +9,7 @@ public readonly record struct MinutesUsage(int Input = 0, int CacheRead = 0, int
   public double? EstimatedCost(string model, bool longCache) {
     (double Input, double Output, double CacheRead)? prices = model switch {
       "claude-opus-5-5" => (4, 20, 0.20),
-      "claude-sonnet-5-5" => (2, 10, 0.20),
+      "claude-sonnet-5-5" => (2, 10, 0.10),
       "claude-haiku-5-5" => (0.10, 0.50, 0.01),
       _ => null,
     };

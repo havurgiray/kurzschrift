@@ -214,7 +214,8 @@ public sealed class TranscriptDocument {
     this.startedAt = startedAt;
     UsesAIMinutes = config.Minutes != null;
     Directory.CreateDirectory(config.SaveFolder);
-    var name = $"{startedAt:yyyy-MM-dd HH-mm} {KindTitle(config)}";
+    // Invariant: the file name is the same whatever calendar or digits Windows is set to.
+    var name = FormattableString.Invariant($"{startedAt:yyyy-MM-dd HH-mm} {KindTitle(config)}");
     var candidate = Path.Combine(config.SaveFolder, name + ".md");
     for (int n = 2; File.Exists(candidate); n++) candidate = Path.Combine(config.SaveFolder, $"{name} {n}.md");
     FilePath = candidate;
@@ -222,11 +223,23 @@ public sealed class TranscriptDocument {
 
   public string BaseName => Path.GetFileNameWithoutExtension(FilePath);
 
-  public void WriteDraft(IEnumerable<LiveEntry> entries, string? minutes = null) => Write(DraftMarkdown(entries, minutes));
+  /// The line a draft carries until the meeting is saved; the recovery at launch replaces it.
+  public const string DraftBanner = "_Recording in progress. Speakers are identified when the recording stops._";
+
+  /// Where the last write went: `FilePath`; the copy in the Unsaved folder when the transcripts
+  /// folder couldn't be written; null when neither worked or nothing was written yet.
+  public string? SavedPath { get; private set; }
+  /// Why the transcripts folder couldn't be written, while that's the case.
+  public string? WriteError { get; private set; }
+  string? fallbackPath;
+  string? loggedError;
+
+  /// Both return false when the file couldn't be written where it belongs (see `SavedPath`).
+  public bool WriteDraft(IEnumerable<LiveEntry> entries, string? minutes = null) => Write(DraftMarkdown(entries, minutes));
 
   public string DraftMarkdown(IEnumerable<LiveEntry> entries, string? minutes) {
     var md = new StringBuilder(Header(null, new()));
-    md.Append("_Recording in progress. Speakers are identified when the recording stops._\n\n");
+    md.Append(DraftBanner + "\n\n");
     md.Append(Context.Markdown);
     if (!string.IsNullOrEmpty(minutes)) md.Append($"## {MinutesHeading} (live draft)\n\n{minutes}\n\n");
     if (!Context.IsEmpty || !string.IsNullOrEmpty(minutes)) md.Append("## Transcript\n\n");
@@ -241,7 +254,7 @@ public sealed class TranscriptDocument {
     return md.ToString();
   }
 
-  public void WriteFinal(List<Turn> turns, DateTime endedAt, List<string> notes, List<string> audioFiles,
+  public bool WriteFinal(List<Turn> turns, DateTime endedAt, List<string> notes, List<string> audioFiles,
       string? minutes = null, List<double>? bookmarks = null, List<(string Question, string Answer)>? qa = null) {
     var pending = new Queue<double>((bookmarks ?? new()).OrderBy(b => b));
     string Marks(double before) {
@@ -278,7 +291,7 @@ public sealed class TranscriptDocument {
       foreach (var t in turns) md.Append(Heading(t.Speaker, t.Start) + $"{t.Translation ?? "_(not translated)_"}\n\n");
     }
     md.Append(Marks(double.PositiveInfinity));
-    Write(md.ToString());
+    return Write(md.ToString());
   }
 
   string Header(DateTime? endedAt, List<string> speakers) {
@@ -291,30 +304,83 @@ public sealed class TranscriptDocument {
     f.Append("type: meeting-transcript\n");
     f.Append($"language: {config.Spoken}\n");
     if (config.Mode == MeetingMode.Translate && config.Target != null) f.Append($"translation: {config.Target}\n");
-    if (speakers.Count > 0) f.Append("speakers: [" + string.Join(", ", speakers.Select(s => $"\"{s}\"")) + "]\n");
+    if (speakers.Count > 0) f.Append("speakers: [" + string.Join(", ", speakers.Select(Yaml)) + "]\n");
     var participants = Context.Names;
-    if (participants.Count > 0)
-      f.Append("participants: [" + string.Join(", ", participants.Select(p => $"\"{p.Replace("\"", "'")}\"")) + "]\n");
+    if (participants.Count > 0) f.Append("participants: [" + string.Join(", ", participants.Select(Yaml)) + "]\n");
     f.Append("---\n\n");
     f.Append($"# {KindTitle(config)}, {startedAt.ToString("d MMM yyyy, HH:mm", CultureInfo.GetCultureInfo("en-GB"))}\n\n");
     return f.ToString();
   }
 
-  static string Iso(DateTime t) => new DateTimeOffset(t).ToString("yyyy-MM-ddTHH:mm:sszzz");
+  static string Iso(DateTime t) => new DateTimeOffset(t).ToString("yyyy-MM-ddTHH:mm:sszzz", CultureInfo.InvariantCulture);
+
+  /// A double-quoted YAML string: a name with a quote or a backslash in it can't break the header.
+  static string Yaml(string text) {
+    var s = text.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    return "\"" + Regex.Replace(s, @"[\r\n\t]+", " ") + "\"";
+  }
 
   static string Heading(string? speaker, double seconds) {
     var time = Clock(seconds);
     return speaker != null ? $"**{speaker}** · {time}\n\n" : $"**{time}**\n\n";
   }
 
-  void Write(string text) {
-    try {
-      var tmp = FilePath + ".tmp";
-      File.WriteAllText(tmp, text, new UTF8Encoding(false));
-      File.Move(tmp, FilePath, true);
-    } catch (Exception e) {
-      Log.Write($"writing transcript failed: {e.Message}");
+  /// Writes the file where it belongs. If that fails (folder gone, protected or full), the text goes
+  /// to the Unsaved folder instead, so it is never only in memory; the caller tells the user.
+  bool Write(string text) {
+    // Text boxes give \r\n; the file has \n throughout, like the Mac's.
+    text = text.Replace("\r\n", "\n").Replace('\r', '\n');
+    if (TryWrite(FilePath, text, out var error)) {
+      if (SavedPath != null && SavedPath != FilePath) {
+        Log.Write("the transcripts folder can be written again");
+        try { File.Delete(SavedPath); } catch { }
+      }
+      SavedPath = FilePath;
+      WriteError = loggedError = null;
+      return true;
     }
+    WriteError = error;
+    if (error != loggedError) Log.Write($"writing transcript failed: {error}");
+    loggedError = error;
+    try {
+      Directory.CreateDirectory(Paths.Unsaved);
+      fallbackPath ??= UniquePath(Paths.Unsaved, BaseName, ".md");
+      if (TryWrite(fallbackPath, text, out var fallbackError)) {
+        SavedPath = fallbackPath;
+        return false;
+      }
+      Log.Write($"writing the fallback transcript failed: {fallbackError}");
+    } catch (Exception e) {
+      Log.Write($"writing the fallback transcript failed: {e.Message}");
+    }
+    SavedPath = null;
+    return false;
+  }
+
+  static bool TryWrite(string path, string text, out string? error) {
+    try {
+      var tmp = path + ".tmp";
+      File.WriteAllText(tmp, text, new UTF8Encoding(false));
+      File.Move(tmp, path, true);
+      error = null;
+      return true;
+    } catch (Exception e) {
+      // Short, for the banner; the full message (with the path) is in the log.
+      error = e switch {
+        DirectoryNotFoundException => "the folder isn't there any more",
+        UnauthorizedAccessException => "Windows doesn't allow writing there",
+        _ => e.Message,
+      };
+      if (e is DirectoryNotFoundException or UnauthorizedAccessException) Log.Write($"transcript write error: {e.Message}");
+      return false;
+    }
+  }
+
+  /// "name.ext" in `folder`, or "name 2.ext", "name 3.ext"… when that exists.
+  public static string UniquePath(string folder, string name, string extension) {
+    var candidate = Path.Combine(folder, name + extension);
+    for (int n = 2; File.Exists(candidate); n++) candidate = Path.Combine(folder, $"{name} {n}{extension}");
+    return candidate;
   }
 
   public static string BookmarkMarkdown(double seconds) => $"**⭐ Bookmark** · {Clock(seconds)}\n\n";

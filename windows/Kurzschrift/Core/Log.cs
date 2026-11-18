@@ -6,7 +6,7 @@ public static class Log {
   static readonly object Gate = new();
 
   public static void Write(string message) {
-    var line = $"{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ} {message}";
+    var line = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture) + " " + message;
     lock (Gate) {
       try {
         Directory.CreateDirectory(Path.GetDirectoryName(Paths.LogFile)!);

@@ -130,9 +130,11 @@ public sealed class MinutesClient {
       return await SendAnthropicAsync(system, chunks, tail, effort, longCache, ct);
     }
 
-    if (Text(Field(json, "stop_reason")) == "refusal") {
+    var stopReason = Text(Field(json, "stop_reason"));
+    if (stopReason == "refusal") {
       throw MinutesException.Refused(Text(Field(Field(json, "stop_details"), "category")));
     }
+    if (stopReason == "max_tokens") throw MinutesException.Truncated();
     var text = string.Concat(
       Items(Field(json, "content"))
         .Where(block => Text(Field(block, "type")) == "text")
@@ -162,8 +164,10 @@ public sealed class MinutesClient {
     AddAuthorization(request);
 
     var json = await PerformAsync(request, TimeSpan.FromSeconds(300), ct);
-    var message = Field(Items(Field(json, "choices")).FirstOrDefault(), "message");
+    var choice = Items(Field(json, "choices")).Cast<JsonElement?>().FirstOrDefault();
+    var message = Field(choice, "message");
     if (Text(Field(message, "refusal")) is { Length: > 0 }) throw MinutesException.Refused(null);
+    if (Text(Field(choice, "finish_reason")) == "length") throw MinutesException.Truncated();
     var text = (Text(Field(message, "content")) ?? "").Trim();
     if (text.Length == 0) throw MinutesException.EmptyResponse();
     var u = Field(json, "usage");
@@ -267,7 +271,7 @@ public sealed class MinutesClient {
 
   /// Server-side refusal fallback (`fallbacks: "default"`) is offered on these models.
   static bool SupportsFallbacks(string model) =>
-    model is "claude-opus-5-5" or "claude-opus-5" or "claude-fable-5-1" or "claude-sonnet-5-5";
+    model is "claude-opus-5-5" or "claude-opus-5" or "claude-fable-5-2" or "claude-fable-5-1" or "claude-sonnet-5-5";
 
   // Prompt
 

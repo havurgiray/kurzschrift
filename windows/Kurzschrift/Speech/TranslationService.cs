@@ -36,7 +36,7 @@ public sealed class TranslationService : IDisposable {
       Log.Write("translation looked like junk; " + (retry.Length > 0 && !IsJunk(trimmed, retry) ? "retried without the trailing number" : "kept the original"));
       result = retry.Length > 0 && !IsJunk(trimmed, retry) ? retry : sentence;
     }
-    result = KeepNumbers(sentence, result);
+    result = KeepNumbers(sentence, result, To);
     if (cache.Count > 5000) cache.Clear();
     cache[sentence] = result;
     return result;
@@ -50,14 +50,18 @@ public sealed class TranslationService : IDisposable {
   }
 
   /// Wikipedia-style markup or links the original doesn't have: the model made something up.
-  static readonly string[] JunkMarkers = { "==", "[[", "]]", "External links", "References", "http", "www.", "©" };
+  /// The section names count only as a heading (the whole output, or next to "=="), not as words:
+  /// "We need two references." and "…your preferences" are ordinary translations.
+  static readonly string[] JunkMarkers = { "==", "[[", "]]", "http", "www.", "©" };
+  static readonly Regex JunkHeading = new(@"^\W*(References|External links|See also)\W*$");
   static bool IsJunk(string original, string translation) =>
-    JunkMarkers.Any(m => translation.Contains(m, StringComparison.OrdinalIgnoreCase) && !original.Contains(m, StringComparison.OrdinalIgnoreCase));
+    JunkMarkers.Any(m => translation.Contains(m, StringComparison.OrdinalIgnoreCase) && !original.Contains(m, StringComparison.OrdinalIgnoreCase)) ||
+    JunkHeading.IsMatch(translation);
 
   /// OPUS-MT sometimes leaves an amount out ("Die Rechnung über 45.000 Euro … ist noch nicht bezahlt"
   /// became "The invoice … is not yet paid" in the tests). When a number of the original is missing
   /// from the translation, it is added in brackets rather than silently lost.
-  static string KeepNumbers(string original, string translation) {
+  static string KeepNumbers(string original, string translation, string target) {
     static string Digits(string s) => Regex.Replace(s, @"[.,:\s]", "");
     var have = Regex.Matches(translation, @"\d[\d.,:]*\d|\d").Select(m => Digits(m.Value)).ToList();
     var missing = new List<string>();
@@ -71,13 +75,39 @@ public sealed class TranslationService : IDisposable {
       if (i >= 0) have.RemoveAt(i); else missing.Add(m.Value);
       return " ";
     });
+    // Exact matches first, so the "2" of "2 offers" can't use up the "2024" another number needs.
+    var open = new List<(string Text, string Digits)>();
     foreach (Match m in Regex.Matches(original, @"\d[\d.,:]*\d|\d")) {
       var d = Digits(m.Value);
       if (d.Length == 0) continue;
-      int i = have.FindIndex(h => h == d || h.Contains(d) || d.Contains(h) && h.Length >= 2);
-      if (i >= 0) have.RemoveAt(i); else missing.Add(m.Value.TrimEnd('.', ','));
+      int i = have.IndexOf(d);
+      if (i >= 0) have.RemoveAt(i); else open.Add((m.Value.TrimEnd('.', ','), d));
+    }
+    foreach (var (text, d) in open) {
+      int i = have.FindIndex(h => h.Contains(d) || d.Contains(h) && h.Length >= 2);
+      if (i >= 0) have.RemoveAt(i);
+      else if (!SpelledOut(text, translation, target)) missing.Add(text);
     }
     return missing.Count == 0 ? translation : $"{translation} [{string.Join(", ", missing)}]";
+  }
+
+  /// "3 Punkte" → "three points", "am 1." → "on the first": a small number written as a word is there.
+  static readonly Dictionary<string, string[]> NumberWords = new() {
+    ["en"] = new[] {
+      "zero", "one|first|once", "two|second|twice|both", "three|third", "four|fourth", "five|fifth", "six|sixth",
+      "seven|seventh", "eight|eighth", "nine|ninth", "ten|tenth", "eleven|eleventh", "twelve|twelfth",
+    },
+    ["de"] = new[] {
+      "null", @"eins|ein|eine[mnrs]?|erste[mnrs]?", @"zwei|zweite[mnrs]?|beide[mnrs]?", @"drei|dritte[mnrs]?", @"vier|vierte[mnrs]?",
+      @"fünf|fünfte[mnrs]?", @"sechs|sechste[mnrs]?", @"sieben|siebte[mnrs]?", @"acht|achte[mnrs]?", @"neun|neunte[mnrs]?",
+      @"zehn|zehnte[mnrs]?", @"elf|elfte[mnrs]?", @"zwölf|zwölfte[mnrs]?",
+    },
+  };
+
+  static bool SpelledOut(string number, string translation, string target) {
+    if (!Regex.IsMatch(number, @"^[0-9]{1,2}$") || !NumberWords.TryGetValue(target, out var words)) return false;
+    int n = int.Parse(number, System.Globalization.CultureInfo.InvariantCulture);
+    return n < words.Length && Regex.IsMatch(translation, $@"\b({words[n]})\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
   }
 
   public void Dispose() {

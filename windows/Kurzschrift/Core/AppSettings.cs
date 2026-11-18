@@ -22,6 +22,8 @@ public sealed class AppSettings : INotifyPropertyChanged {
   string myName = "Me";
   bool showLiveWindow = true;
   bool liveWindowSmall;
+  string liveWindowBounds = "";
+  string liveBarBounds = "";
   double liveFontSize = 15;
   int provisionalSeconds = 2;
   bool keepAudio = true;
@@ -47,6 +49,7 @@ public sealed class AppSettings : INotifyPropertyChanged {
   string transcribeLanguage = "en";
   bool transcribeIncludeMic = true;
   bool transcribeSeparateSpeakers = true;
+  bool transcribeSecondEntry = true;
 
   // Minutes (sent to an LLM provider; off by default)
   bool minutesForTranslate;
@@ -63,12 +66,19 @@ public sealed class AppSettings : INotifyPropertyChanged {
   bool micShared;
 
   bool developerLinks;
+  bool automationLinks;
+  bool checkForUpdates;
+  DateTime updateLastChecked;
+  string updateKnownVersion = "";
 
   public string SaveFolder { get => saveFolder; set => Set(ref saveFolder, value); }
   public string MyName { get => myName; set => Set(ref myName, value); }
   public bool ShowLiveWindow { get => showLiveWindow; set => Set(ref showLiveWindow, value); }
   /// The meeting window shrunk to a small bar: clock, latest caption, Bookmark and Stop.
   public bool LiveWindowSmall { get => liveWindowSmall; set => Set(ref liveWindowSmall, value); }
+  /// Where the meeting window and the small bar were last: "left,top,width,height".
+  public string LiveWindowBounds { get => liveWindowBounds; set => Set(ref liveWindowBounds, value ?? ""); }
+  public string LiveBarBounds { get => liveBarBounds; set => Set(ref liveBarBounds, value ?? ""); }
   public double LiveFontSize { get => liveFontSize; set => Set(ref liveFontSize, value); }
   /// How often provisional text is refreshed while someone speaks (0 = only finished sentences).
   public int ProvisionalSeconds { get => provisionalSeconds; set => Set(ref provisionalSeconds, value); }
@@ -96,6 +106,8 @@ public sealed class AppSettings : INotifyPropertyChanged {
   public string TranscribeLanguage { get => transcribeLanguage; set => Set(ref transcribeLanguage, value); }
   public bool TranscribeIncludeMic { get => transcribeIncludeMic; set => Set(ref transcribeIncludeMic, value); }
   public bool TranscribeSeparateSpeakers { get => transcribeSeparateSpeakers; set => Set(ref transcribeSeparateSpeakers, value); }
+  /// A second "Transcribe Meeting" entry in the menu, in the spoken language of Translate Meeting.
+  public bool TranscribeSecondEntry { get => transcribeSecondEntry; set => Set(ref transcribeSecondEntry, value); }
 
   public bool MinutesForTranslate { get => minutesForTranslate; set => Set(ref minutesForTranslate, value); }
   public bool MinutesForTranscribe { get => minutesForTranscribe; set => Set(ref minutesForTranscribe, value); }
@@ -107,14 +119,26 @@ public sealed class AppSettings : INotifyPropertyChanged {
   public string MinutesPrompt { get => minutesPrompt; set => Set(ref minutesPrompt, value); }
 
   /// The output device the meeting plays on; "" = Windows' default output at the time.
-  public string MeetingDeviceId { get => meetingDeviceId; set => Set(ref meetingDeviceId, value); }
-  public string MicDeviceId { get => micDeviceId; set => Set(ref micDeviceId, value); }
+  public string MeetingDeviceId { get => meetingDeviceId; set => Set(ref meetingDeviceId, value ?? ""); }
+  public string MicDeviceId { get => micDeviceId; set => Set(ref micDeviceId, value ?? ""); }
   /// Several people share your microphone (a meeting room): separate their voices too.
   public bool MicShared { get => micShared; set => Set(ref micShared, value); }
 
   /// kurzschrift:// links meant for testing (start?audio=, snapshot, window, context).
   /// Off by default: any web page can try to open a kurzschrift:// link.
   public bool DeveloperLinks { get => developerLinks; set => Set(ref developerLinks, value); }
+
+  /// kurzschrift:// links that send the transcript to the AI provider or change the saved file
+  /// (ask, minutes when it starts or redoes AI minutes, rename). Off by default, for the same
+  /// reason. Start, stop, toggle and bookmark links always work.
+  public bool AutomationLinks { get => automationLinks; set => Set(ref automationLinks, value); }
+
+  /// Ask GitHub once a day whether a newer release exists. Off by default: it is the one request
+  /// Kurzschrift would make by itself.
+  public bool CheckForUpdates { get => checkForUpdates; set => Set(ref checkForUpdates, value); }
+  /// When the last check succeeded (UTC), and a newer version it found, so the menu keeps offering it.
+  public DateTime UpdateLastChecked { get => updateLastChecked; set => Set(ref updateLastChecked, value); }
+  public string UpdateKnownVersion { get => updateKnownVersion; set => Set(ref updateKnownVersion, value); }
 
   public static readonly int[] AudioBitrateChoices = { 16, 24, 32, 48, 0 };
   public static readonly int[] AutoStopChoices = { 0, 5, 10, 15, 30, 60 };
@@ -160,20 +184,23 @@ public sealed class AppSettings : INotifyPropertyChanged {
 
   /// null when minutes are off for this mode, or on but missing a key or model (`MinutesProblem` says which).
   /// `evenIfOff` is for switching them on by hand during or after a meeting.
-  public MinutesConfig? MinutesConfigFor(MeetingMode mode, bool evenIfOff = false) {
+  /// `spoken` is the language of a transcribed meeting when it isn't the first Transcribe entry's.
+  public MinutesConfig? MinutesConfigFor(MeetingMode mode, bool evenIfOff = false, string? spoken = null) {
     if (!evenIfOff && !MinutesEnabled(mode)) return null;
-    var language = Languages.Name(mode == MeetingMode.Translate ? TranslateTarget : TranscribeLanguage);
+    var language = Languages.Name(mode == MeetingMode.Translate ? TranslateTarget : spoken ?? TranscribeLanguage);
     return MinutesConfig.FromSettings(Provider, MinutesModel.Trim(), MinutesIntervalMinutes, language, MinutesPrompt, VocabularyTerms);
   }
 
   public string? MinutesProblem(MeetingMode mode) => MinutesConfig.Problem(MinutesEnabled(mode), Provider, MinutesModel.Trim());
 
   /// Frozen copy of the settings a session runs with, so edits mid-meeting don't half-apply.
-  public SessionConfig Snapshot(MeetingMode mode) {
+  /// `secondLanguage` is the second Transcribe entry: Translate Meeting's language, not translated.
+  public SessionConfig Snapshot(MeetingMode mode, bool secondLanguage = false) {
     bool translate = mode == MeetingMode.Translate;
+    var spoken = translate ? TranslateSpoken : secondLanguage && SecondTranscribe is { } second ? second : TranscribeLanguage;
     return new SessionConfig {
       Mode = mode,
-      Spoken = translate ? TranslateSpoken : TranscribeLanguage,
+      Spoken = spoken,
       Target = translate ? TranslateTarget : null,
       IncludeMic = translate ? TranslateIncludeMic : TranscribeIncludeMic,
       SeparateSpeakers = translate ? TranslateSeparateSpeakers : TranscribeSeparateSpeakers,
@@ -185,7 +212,7 @@ public sealed class AppSettings : INotifyPropertyChanged {
       KeepAudio = KeepAudio,
       AudioBitrate = AudioBitrate,
       Layout = translate ? TranslateLayout : TranscriptLayout.Interleaved,
-      Minutes = MinutesConfigFor(mode),
+      Minutes = MinutesConfigFor(mode, spoken: spoken),
       Vocabulary = VocabularyTerms,
       ProvisionalSeconds = ProvisionalSeconds,
     };
@@ -194,6 +221,16 @@ public sealed class AppSettings : INotifyPropertyChanged {
   public string MenuTitle(MeetingMode mode) => mode == MeetingMode.Translate
     ? $"Translate Meeting ({Languages.Name(TranslateSpoken)} → {Languages.Name(TranslateTarget)})"
     : $"Transcribe Meeting ({Languages.Name(TranscribeLanguage)})";
+
+  /// The second Transcribe entry's language, or null when it's switched off or would only repeat
+  /// the first entry.
+  [JsonIgnore]
+  public string? SecondTranscribe =>
+    TranscribeSecondEntry && Languages.Base(TranslateSpoken) != Languages.Base(TranscribeLanguage) ? TranslateSpoken : null;
+
+  /// Its title in the menu, e.g. "Transcribe Meeting (German)".
+  [JsonIgnore]
+  public string? SecondTranscribeTitle => SecondTranscribe is { } l ? $"Transcribe Meeting ({Languages.Name(l)})" : null;
 
   public static string AudioBitrateName(int kbps) {
     int rate = kbps > 0 ? kbps : 16000 * 16 / 1000;
@@ -219,14 +256,28 @@ public sealed class AppSettings : INotifyPropertyChanged {
     saveTimer = new Timer(_ => Save(), null, 300, Timeout.Infinite);
   }
 
+  /// Writes pending changes now; the save otherwise runs 300 ms after the last change, which
+  /// quitting right after a change would cut off.
+  public void Flush() {
+    saveTimer?.Dispose();
+    saveTimer = null;
+    Save();
+  }
+
+  static readonly object SaveGate = new();
+
   public void Save() {
-    try {
-      Directory.CreateDirectory(Paths.Config);
-      var tmp = Paths.SettingsFile + ".tmp";
-      File.WriteAllText(tmp, JsonSerializer.Serialize(new Stored(this), JsonOptions));
-      File.Move(tmp, Paths.SettingsFile, true);
-    } catch (Exception e) {
-      Log.Write($"saving settings failed: {e.Message}");
+    // One at a time: the delayed save and a direct one (at launch, at quit) can meet, and both
+    // write the same temporary file.
+    lock (SaveGate) {
+      try {
+        Directory.CreateDirectory(Paths.Config);
+        var tmp = Paths.SettingsFile + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(new Stored(this), JsonOptions));
+        File.Move(tmp, Paths.SettingsFile, true);
+      } catch (Exception e) {
+        Log.Write($"saving settings failed: {e.Message}");
+      }
     }
   }
 

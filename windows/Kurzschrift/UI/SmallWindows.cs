@@ -73,13 +73,22 @@ public static class DownloadWindow {
     return await done.Task;
   }
 
-  static string Mb(long bytes) => bytes >= 1_000_000_000 ? $"{bytes / 1e9:0.0} GB" : $"{bytes / 1e6:0} MB";
+  static string Mb(long bytes) => bytes >= 1_000_000_000
+    ? FormattableString.Invariant($"{bytes / 1e9:0.0} GB")
+    : FormattableString.Invariant($"{bytes / 1e6:0} MB");
 }
 
 /// TV-style captions along the bottom (or top) of the screen while recording. Clicks pass through.
 public sealed class SubtitlesWindow : Window {
   static SubtitlesWindow? shared;
-  readonly TextBlock text = new() { Foreground = Brushes.White, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center };
+  /// In a translated meeting: what was said, smaller, above its translation (as on the Mac).
+  readonly TextBlock original = new() {
+    Foreground = Brushes.White, Opacity = 0.75, TextTrimming = TextTrimming.CharacterEllipsis, TextAlignment = TextAlignment.Center,
+    Margin = new Thickness(0, 0, 0, 4), Visibility = Visibility.Collapsed,
+  };
+  readonly TextBlock text = new() {
+    Foreground = Brushes.White, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, FontWeight = FontWeights.SemiBold,
+  };
   readonly Border border;
 
   SubtitlesWindow() {
@@ -93,8 +102,12 @@ public sealed class SubtitlesWindow : Window {
     SizeToContent = SizeToContent.Height;
     border = new Border {
       Background = new SolidColorBrush(Color.FromArgb(190, 0, 0, 0)), CornerRadius = new CornerRadius(10),
-      Padding = new Thickness(18, 10, 18, 12), Child = text, HorizontalAlignment = HorizontalAlignment.Center,
+      Padding = new Thickness(18, 10, 18, 12), HorizontalAlignment = HorizontalAlignment.Center,
     };
+    var lines = new StackPanel();
+    lines.Children.Add(original);
+    lines.Children.Add(text);
+    border.Child = lines;
     Content = border;
     SourceInitialized += (_, _) => {
       var h = new WindowInteropHelper(this).Handle;
@@ -103,7 +116,6 @@ public sealed class SubtitlesWindow : Window {
     var s = SessionController.Shared;
     s.Entries.CollectionChanged += (_, _) => Refresh();
     s.Partials.CollectionChanged += (_, _) => Refresh();
-    s.PropertyChanged += (_, e) => { if (e.PropertyName == nameof(SessionController.Phase)) Update(); };
     refresher.Tick += (_, _) => Refresh();
     IsVisibleChanged += (_, _) => { if (IsVisible) refresher.Start(); else refresher.Stop(); };
   }
@@ -112,12 +124,22 @@ public sealed class SubtitlesWindow : Window {
 
   void Refresh() {
     var s = SessionController.Shared;
-    var p = s.Partials.LastOrDefault();
-    var e = s.Entries.LastOrDefault(x => !x.IsBookmark);
-    var line = p != null ? (p.Translation ?? p.Original) : e != null ? (e.Translation ?? e.Original) : "";
+    string? above = null;
+    string line = "";
+    if (s.CurrentCaption is { } now) {
+      if (s.Config?.Mode == MeetingMode.Translate) {
+        above = now.Original.Length > 120 ? "…" + now.Original[^120..] : now.Original;
+        line = now.Translation ?? "…";
+      } else {
+        line = now.Original;
+      }
+    }
     if (line.Length > 220) line = "…" + line[^220..];
-    text.Text = line;
+    if (text.Text != line) text.Text = line;
+    if (original.Text != (above ?? "")) original.Text = above ?? "";
+    original.Visibility = above != null ? Visibility.Visible : Visibility.Collapsed;
     text.FontSize = AppSettings.Shared.SubtitleFontSize;
+    original.FontSize = Math.Max(11, AppSettings.Shared.SubtitleFontSize * 0.6);
     border.Visibility = line.Length > 0 ? Visibility.Visible : Visibility.Hidden;
     Place();
   }
@@ -130,7 +152,8 @@ public sealed class SubtitlesWindow : Window {
   }
 
   public static void Update() {
-    bool on = AppSettings.Shared.Subtitles && SessionController.Shared.IsRecording;
+    // While a meeting is starting, running or being saved (the last line stays up while it is saved).
+    bool on = AppSettings.Shared.Subtitles && !SessionController.Shared.IsIdle;
     if (on) {
       shared ??= new SubtitlesWindow();
       shared.Show();
@@ -141,14 +164,18 @@ public sealed class SubtitlesWindow : Window {
   }
 
   public static void Snapshot(string path) {
-    if (shared is not { IsVisible: true } w) return;
+    if (shared is not { IsVisible: true } w) {
+      Log.Write("snapshot: no subtitles on screen");
+      return;
+    }
+    w.Refresh();
+    w.UpdateLayout();
     var el = (FrameworkElement)w.Content;
-    var bmp = new RenderTargetBitmap((int)el.ActualWidth, (int)el.ActualHeight, 96, 96, PixelFormats.Pbgra32);
-    bmp.Render(el);
-    var enc = new PngBitmapEncoder();
-    enc.Frames.Add(BitmapFrame.Create(bmp));
-    using var f = File.Create(path);
-    enc.Save(f);
+    if (el.ActualWidth < 1 || el.ActualHeight < 1) {
+      Log.Write("snapshot: the subtitles are empty");
+      return;
+    }
+    LiveWindow.Render(el, w, path);
   }
 
   [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int index);

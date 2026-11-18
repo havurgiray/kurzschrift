@@ -18,35 +18,64 @@ public static class CallDetector {
   const string Store = @"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone";
 
   static DispatcherTimer? timer;
+  /// The meeting app currently in a call, and since when (on `clock`).
   static string? callApp;
-  static bool recordingDuringCall;
+  static double callSince;
+  static double? missingSince;
+  static bool offered;
+  /// The recording that overlapped the current call, so the call's end stops that one and not a
+  /// recording started afterwards.
+  static Guid? recordingDuringCall;
   static Window? prompt;
+  static readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
 
   public static void Apply() {
     timer?.Stop();
     timer = null;
+    callApp = null;
+    missingSince = null;
+    offered = false;
+    recordingDuringCall = null;
     if (!AppSettings.Shared.DetectCalls) return;
-    callApp = AppUsingMicrophone();  // a call already running at launch doesn't prompt
-    timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+    timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
     timer.Tick += (_, _) => Poll();
     timer.Start();
   }
 
+  /// The same rules as the Mac's: a call is offered once, after 3 s of microphone use (also one
+  /// that was already running at launch, and again when the calling app changes); it has ended
+  /// only after 20 s without the microphone, because muting or switching the device lets go of it
+  /// for a moment.
   static void Poll() {
     var s = SessionController.Shared;
-    var app = AppUsingMicrophone();
-    if (callApp != null && s.IsRecording) recordingDuringCall = true;
-    if (app != null && callApp == null) {
-      callApp = app;
-      recordingDuringCall = s.IsRecording;
-      Log.Write($"call started in {app}");
-      if (s.IsIdle) ShowPrompt(app);
-    } else if (app == null && callApp != null) {
-      Log.Write($"call ended in {callApp}");
-      callApp = null;
+    var inCall = AppUsingMicrophone();
+    double now = clock.Elapsed.TotalSeconds;
+    if (inCall != null) {
+      // Let go for a while and in use again: the next call, back to back with the last one.
+      bool nextCall = missingSince is double m && now - m >= 6;
+      missingSince = null;
+      if (callApp != inCall || nextCall) {
+        callApp = inCall;
+        callSince = now;
+        offered = false;
+        Log.Write($"call detected: {inCall}");
+      }
+      if (s.IsRecording) recordingDuringCall = s.MeetingId;
+      if (!offered && s.IsIdle && now - callSince >= 3) {
+        offered = true;
+        ShowPrompt(inCall);
+      }
+    } else if (callApp != null) {
+      missingSince ??= now;
+      if (now - missingSince.Value < 20) return;
+      Log.Write($"call ended: {callApp}");
       prompt?.Close();
-      if (recordingDuringCall && s.IsRecording && AppSettings.Shared.StopWhenCallEnds) _ = s.Stop();
-      recordingDuringCall = false;
+      if (recordingDuringCall is Guid recording && recording == s.MeetingId && AppSettings.Shared.StopWhenCallEnds && s.IsRecording)
+        _ = s.Stop();
+      callApp = null;
+      missingSince = null;
+      offered = false;
+      recordingDuringCall = null;
     }
   }
 

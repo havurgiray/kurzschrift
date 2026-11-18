@@ -11,7 +11,7 @@ namespace Kurzschrift;
 /// The speech bubble in the notification area, with the same menu as the Mac's menu bar item.
 public sealed class TrayIcon : IDisposable {
   readonly Forms.NotifyIcon icon;
-  readonly Icon idleIcon = Draw(false), recordingIcon = Draw(true);
+  readonly Icon idleIcon = Draw(false), recordingIcon = Draw(true), busyIcon = Draw(false, dimmed: true);
   readonly Forms.Timer timer;
 
   public TrayIcon() {
@@ -37,29 +37,32 @@ public sealed class TrayIcon : IDisposable {
 
   void Refresh() {
     var s = SessionController.Shared;
-    icon.Icon = s.IsRecording ? recordingIcon : idleIcon;
+    icon.Icon = s.Phase switch { Phase.Recording => recordingIcon, Phase.Idle => idleIcon, _ => busyIcon };
     var text = s.Phase switch {
-      Phase.Recording => $"Kurzschrift: recording {s.ElapsedText}",
+      Phase.Recording => $"Kurzschrift: {(s.Config?.Mode == MeetingMode.Translate ? "translating" : "transcribing")} {s.ElapsedText}",
       Phase.Starting or Phase.Finishing => $"Kurzschrift: {s.PhaseText}",
       _ => "Kurzschrift",
     };
     icon.Text = text.Length > 63 ? text[..63] : text;
   }
 
+  /// The same entries in the same order as the Mac's menu bar menu.
   void BuildMenu() {
     var s = SessionController.Shared;
     var settings = AppSettings.Shared;
     var m = icon.ContextMenuStrip!;
     m.Items.Clear();
     Forms.ToolStripMenuItem Item(string text, Action action, bool enabled = true, string? keys = null) {
-      var item = new Forms.ToolStripMenuItem(text) { Enabled = enabled, ShortcutKeyDisplayString = keys };
+      // The shortcuts are only shown while they work.
+      var item = new Forms.ToolStripMenuItem(text) { Enabled = enabled, ShortcutKeyDisplayString = settings.GlobalShortcuts ? keys : null };
       item.Click += (_, _) => action();
       m.Items.Add(item);
       return item;
     }
 
     if (s.IsRecording) {
-      Item($"Recording {s.ElapsedText}", () => LiveWindow.ShowShared(), true).Font = new Font(m.Font, System.Drawing.FontStyle.Bold);
+      var title = s.Config?.Mode == MeetingMode.Translate ? "Translating…" : "Transcribing…";
+      Item($"{title} {s.ElapsedText}", () => LiveWindow.ShowShared()).Font = new Font(m.Font, System.Drawing.FontStyle.Bold);
       Item("Stop and Save", () => _ = s.Stop());
       Item("Bookmark This Moment", s.AddBookmark, keys: "Ctrl+Alt+B");
     } else if (!s.IsIdle) {
@@ -67,37 +70,43 @@ public sealed class TrayIcon : IDisposable {
     } else {
       Item(settings.MenuTitle(MeetingMode.Translate), () => _ = s.Start(MeetingMode.Translate), keys: "Ctrl+Alt+T");
       Item(settings.MenuTitle(MeetingMode.Transcribe), () => _ = s.Start(MeetingMode.Transcribe), keys: "Ctrl+Alt+R");
+      if (settings.SecondTranscribeTitle is { } second)
+        Item(second, () => _ = s.Start(MeetingMode.Transcribe, secondLanguage: true));
     }
-    m.Items.Add(new Forms.ToolStripSeparator());
-    Item(settings.LiveWindowSmall ? "Expand Live Window" : "Show Live Window", () => {
-      settings.LiveWindowSmall = false;
-      LiveWindow.ShowShared();
-    });
-    if (!settings.LiveWindowSmall) Item("Minimize Live Window to a Bar", () => {
-      settings.LiveWindowSmall = true;
-      LiveWindow.ShowShared();
-    });
-    var subtitles = Item("Subtitles", () => settings.Subtitles = !settings.Subtitles);
-    subtitles.Checked = settings.Subtitles;
-
-    var export = new Forms.ToolStripMenuItem("Export Transcript") { Enabled = s.CanExport };
-    var copy = new Forms.ToolStripMenuItem("Copy as Text");
-    copy.Click += (_, _) => Clipboard.SetText(s.ExportText());
-    var save = new Forms.ToolStripMenuItem("Save as Markdown…");
-    save.Click += (_, _) => LiveWindow.SaveAs(markdown: true);
-    var saveText = new Forms.ToolStripMenuItem("Save as Text…");
-    saveText.Click += (_, _) => LiveWindow.SaveAs(markdown: false);
-    export.DropDownItems.AddRange(new Forms.ToolStripItem[] { copy, save, saveText });
-    m.Items.Add(export);
 
     m.Items.Add(new Forms.ToolStripSeparator());
+    Item("Show Live Window", () => LiveWindow.ShowShared());
+    Item(settings.LiveWindowSmall ? "Expand Live Window" : "Minimize Live Window to a Bar", () => {
+      settings.LiveWindowSmall = !settings.LiveWindowSmall;
+      LiveWindow.ShowShared();
+    });
+    if (s.CanExport) {
+      var export = new Forms.ToolStripMenuItem("Export Transcript");
+      var save = new Forms.ToolStripMenuItem("Save as Markdown…");
+      save.Click += (_, _) => LiveWindow.SaveAs(markdown: true);
+      var saveText = new Forms.ToolStripMenuItem("Save as Text…");
+      saveText.Click += (_, _) => LiveWindow.SaveAs(markdown: false);
+      var copy = new Forms.ToolStripMenuItem("Copy to Clipboard");
+      copy.Click += (_, _) => LiveWindow.Copy(s.ExportText());
+      export.DropDownItems.AddRange(new Forms.ToolStripItem[] { save, saveText, copy });
+      m.Items.Add(export);
+    }
     Item("Open Last Transcript", () => Open(s.LastTranscript!), s.LastTranscript != null && File.Exists(s.LastTranscript));
+    Item("Subtitles", () => settings.Subtitles = !settings.Subtitles).Checked = settings.Subtitles;
     Item("Open Transcripts Folder", () => {
-      Directory.CreateDirectory(Environment.ExpandEnvironmentVariables(settings.SaveFolder));
+      try {
+        Directory.CreateDirectory(Environment.ExpandEnvironmentVariables(settings.SaveFolder));
+      } catch (Exception e) {
+        Log.Write($"creating the transcripts folder failed: {e.Message}");
+      }
       Open(Environment.ExpandEnvironmentVariables(settings.SaveFolder));
     });
-    Item("Settings…", SettingsWindow.ShowShared);
+
     m.Items.Add(new Forms.ToolStripSeparator());
+    if (UpdateChecker.AvailableVersion is { } version)
+      Item($"Get Kurzschrift {version}…", () => Open(UpdateChecker.AvailablePage)).Font = new Font(m.Font, System.Drawing.FontStyle.Bold);
+    Item("Check for Updates…", () => _ = UpdateChecker.CheckAndTell(), UpdateChecker.State != UpdateChecker.Status.Checking);
+    Item("Settings…", SettingsWindow.ShowShared);
     Item("Quit Kurzschrift", App.Instance.Quit);
   }
 
@@ -111,13 +120,14 @@ public sealed class TrayIcon : IDisposable {
 
   public void ShowBalloon(string title, string text) => icon.ShowBalloonTip(8000, title, text, Forms.ToolTipIcon.None);
 
-  /// A speech bubble with three lines; a red dot while recording.
-  static Icon Draw(bool recording) {
+  /// A speech bubble with three lines; a red dot while recording; dimmed while a meeting is
+  /// starting or being saved.
+  static Icon Draw(bool recording, bool dimmed = false) {
     using var bmp = new Bitmap(32, 32);
     using (var g = Graphics.FromImage(bmp)) {
       g.SmoothingMode = SmoothingMode.AntiAlias;
       g.Clear(Color.Transparent);
-      var fill = Color.FromArgb(255, 0x2B, 0x6C, 0xD8);
+      var fill = Color.FromArgb(dimmed ? 120 : 255, 0x2B, 0x6C, 0xD8);
       using var path = new GraphicsPath();
       path.AddArc(2, 3, 8, 8, 180, 90);
       path.AddArc(22, 3, 8, 8, 270, 90);
@@ -128,7 +138,7 @@ public sealed class TrayIcon : IDisposable {
       path.CloseFigure();
       using var brush = new SolidBrush(fill);
       g.FillPath(brush, path);
-      using var pen = new Pen(Color.White, 2.2f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+      using var pen = new Pen(Color.FromArgb(dimmed ? 170 : 255, Color.White), 2.2f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
       g.DrawLine(pen, 8, 9, 24, 9);
       g.DrawLine(pen, 8, 13.5f, 24, 13.5f);
       g.DrawLine(pen, 8, 18, 18, 18);

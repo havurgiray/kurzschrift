@@ -1,0 +1,15 @@
+Before you use Kurzschrift
+
+NO WARRANTY
+Kurzschrift is free software under the GNU Affero General Public License, version 3. It is provided "as is", without warranty of any kind. To the extent the law allows, its author and contributors are not liable for any damage or loss from using it, including a meeting that was not recorded, a lost or wrong transcript, and anything decided on the basis of one (sections 15 and 16 of the license).
+
+THE OUTPUT CAN BE WRONG
+Speech recognition mishears words and names, translation can drop or change meaning, speakers can be mixed up, and AI minutes can state things nobody said. Check anything that matters against the recording.
+
+RECORDING IS YOUR RESPONSIBILITY
+Whether you may record, transcribe or translate a conversation depends on where you and the others are, and on the rules of your workplace or school. Many places require everyone's consent, and data-protection law applies to what you record. Kurzschrift does not announce itself to the other participants. Let the people in your meetings know that you transcribe them.
+
+WHAT LEAVES YOUR PC
+Speech recognition, translation and speaker separation run on this PC. The transcript text is sent to Anthropic or OpenAI only if you turn on AI minutes or ask a question, with your own API key. The models are downloaded once at the first meeting. A check for new versions happens only when you ask for it or switch it on.
+
+Details: https://github.com/havurgiray/kurzschrift#privacy

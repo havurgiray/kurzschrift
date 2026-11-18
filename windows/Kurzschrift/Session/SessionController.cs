@@ -31,6 +31,12 @@ public sealed class FinishedMeeting {
   public List<string> Notes { get; init; } = new();
   public List<string> AudioFiles { get; init; } = new();
   public string? Minutes { get; set; }
+  /// The final minutes couldn't be written (no network, a rejected key…); they can be tried again.
+  public bool MinutesFailed { get; set; }
+  /// The note about that in `Notes`, removed when a later try works.
+  public string? MinutesNote { get; set; }
+  /// The questions asked about this meeting; the answered ones are in its file.
+  public List<QAItem> Questions { get; init; } = new();
   public List<double> Bookmarks { get; init; } = new();
   public required SessionConfig Config { get; init; }
   /// Voice print per speaker name, for "remember this voice" when renaming.
@@ -108,8 +114,23 @@ public sealed class SessionController : Observable {
   string? recordingFolder;
   MinutesRunner? minutesRunner;
   CancellationTokenSource? contextDelay;
-  string? minutesWarning;
-  DateTime lastSpeechAt = DateTime.Now;
+  // What the warning banner is made of (see UpdateWarning).
+  string? minutesWarning, silenceWarning, microphoneWarning, recordingWarning, loadWarning, translationWarning, saveWarning;
+  readonly Dictionary<AudioSourceKind, string> captureWarnings = new();
+  /// The finished file has been written at least once: no draft may overwrite it any more.
+  bool finalWritten;
+  /// The recording folder still holds something that couldn't be saved anywhere else.
+  bool keepRecordingFolder;
+  /// The meeting finished before the current one, for answers and minutes that arrive late.
+  FinishedMeeting? lastFinished;
+  /// The meeting's clock: elapsed time, bookmarks and auto-stop run on it, so a change of the PC's
+  /// clock (daylight saving, a time sync) during a meeting can't shift or end it.
+  readonly System.Diagnostics.Stopwatch clock = new();
+  double Now => clock.Elapsed.TotalSeconds;
+  /// On `clock`: when speech was last recognized.
+  double lastSpeechAt;
+  /// A new one for every meeting, so call detection can tell "the recording that ran during this call".
+  public Guid MeetingId { get; private set; }
   readonly List<double> bookmarks = new();
   Guid sessionId = Guid.NewGuid();
   DispatcherTimer? tick;
@@ -125,23 +146,119 @@ public sealed class SessionController : Observable {
     Raise(nameof(CanAsk));
     Raise(nameof(CanStartAIMinutes));
     Raise(nameof(CanRedoMinutes));
+    Raise(nameof(CanRetryMinutes));
+    Raise(nameof(CanEditMinutes));
     Raise(nameof(CanExport));
+  }
+
+  /// "Transcribing German" or "Translating German → English", for the window's header.
+  public string ModeDescription => config is not { } c ? ""
+    : c.Mode == MeetingMode.Translate && c.Target != null
+      ? $"Translating {Languages.Name(c.Spoken)} → {Languages.Name(c.Target)}"
+      : $"Transcribing {Languages.Name(c.Spoken)}";
+
+  /// What is being said right now, for the small bar and the subtitles: the newest line in
+  /// progress, or the last finished one while nobody is mid-sentence.
+  public (string? Speaker, string Original, string? Translation)? CurrentCaption {
+    get {
+      var partial = Partials.LastOrDefault(p => p.Original.Length > 0);
+      if (partial != null) return (partial.Speaker, partial.Original, partial.Translation);
+      var entry = Entries.LastOrDefault(e => !e.IsBookmark);
+      return entry != null ? (entry.Speaker, entry.Original, entry.Translation) : null;
+    }
+  }
+
+  /// The banner shows everything that's wrong right now, most urgent first.
+  void UpdateWarning() {
+    var all = new[] {
+      loadWarning, translationWarning, captureWarnings.GetValueOrDefault(AudioSourceKind.System),
+      captureWarnings.GetValueOrDefault(AudioSourceKind.Microphone), silenceWarning, microphoneWarning, recordingWarning,
+      saveWarning, minutesWarning,
+    }.Where(w => !string.IsNullOrEmpty(w)).ToList();
+    Warning = all.Count > 0 ? string.Join("\n", all) : null;
+  }
+
+  void ClearWarnings(bool keepMinutes = false) {
+    silenceWarning = microphoneWarning = recordingWarning = loadWarning = translationWarning = saveWarning = null;
+    if (!keepMinutes) minutesWarning = null;
+    captureWarnings.Clear();
+    UpdateWarning();
+  }
+
+  /// The draft file, while the meeting runs. If the transcripts folder can't be written, the draft
+  /// goes to the Unsaved folder and the banner says so, instead of nobody noticing until the end.
+  void WriteDraft(string? minutes) {
+    if (document is not { } doc || finalWritten) return;
+    bool ok = doc.WriteDraft(Entries, minutes);
+    var warning = ok ? null
+      : doc.SavedPath != null
+        ? $"The transcript can't be written to {Path.GetDirectoryName(doc.FilePath)} ({doc.WriteError}). For now it is kept in {Path.GetDirectoryName(doc.SavedPath)}."
+        : $"The transcript can't be written to {Path.GetDirectoryName(doc.FilePath)} ({doc.WriteError}). It is only in this window: export it from the menu before you quit.";
+    if (warning != saveWarning) {
+      saveWarning = warning;
+      UpdateWarning();
+    }
+  }
+
+  /// A capture that stops by itself (device unplugged, switched off) shows in the banner until it's back.
+  void Watch(WasapiSource source, AudioSourceKind kind, Guid id) {
+    source.Interrupted += () => Ui.Post(() => {
+      if (id != sessionId) return;
+      captureWarnings[kind] = kind == AudioSourceKind.System
+        ? "The meeting audio stopped (device unplugged or changed). Kurzschrift is trying to reconnect…"
+        : "The microphone stopped (device unplugged or changed). Kurzschrift is trying to reconnect…";
+      UpdateWarning();
+    });
+    source.Resumed += () => Ui.Post(() => {
+      if (id != sessionId) return;
+      captureWarnings.Remove(kind);
+      UpdateWarning();
+    });
+  }
+
+  /// Any microphone failure: the meeting is recorded from the meeting audio alone, with a warning.
+  void DropMicrophone(SessionConfig config, Exception e) {
+    Log.Write($"microphone unavailable, recording the meeting audio only: {e.Message}");
+    bool denied = e is UnauthorizedAccessException || (e is COMException c && (uint)c.HResult == 0x80070005);
+    microphoneWarning = denied
+      ? "Kurzschrift isn't allowed to use the microphone (Windows Settings → Privacy & security → Microphone → " +
+        "\"Let desktop apps access your microphone\"). It is recording the meeting audio only."
+      : "No usable microphone was found. Kurzschrift is recording the meeting audio only.";
+    if (sources.Remove(AudioSourceKind.Microphone, out var source)) {
+      try { source.Dispose(); } catch { }
+    }
+    if (tracks.Remove(AudioSourceKind.Microphone, out var track)) {
+      track.Close(finishSpeech: false);
+      try { File.Delete(track.FilePath); } catch { }
+    }
+    if (vads.Remove(AudioSourceKind.Microphone, out var vad)) {
+      try { vad.Dispose(); } catch { }
+    }
+    config.IncludeMic = false;
+    UpdateWarning();
   }
 
   // MARK: Start
 
   /// `testAudio` replays a recording instead of capturing the meeting audio (no microphone), for testing.
-  public async Task Start(MeetingMode mode, string? testAudio = null) {
+  /// `secondLanguage` starts the second Transcribe entry (see `AppSettings.SecondTranscribe`).
+  public async Task Start(MeetingMode mode, string? testAudio = null, bool secondLanguage = false) {
     if (phase != Phase.Idle) {
       Log.Write($"start({mode}) ignored: phase is {phase}");
       return;
     }
-    Log.Write($"start({mode.ToString().ToLowerInvariant()})");
-    var config = AppSettings.Shared.Snapshot(mode);
+    Log.Write($"start({mode.ToString().ToLowerInvariant()}{(secondLanguage ? ", second language" : "")})");
+    FinishEditingMinutes();  // notes of the last meeting that are still being typed go into its file first
+    var config = AppSettings.Shared.Snapshot(mode, secondLanguage);
     if (testAudio != null) config.IncludeMic = false;
     Config = config;
-    context = new MeetingContext();
-    Raise(nameof(Context));
+    MeetingId = Guid.NewGuid();
+    // While a finished meeting is shown, the Context tab is that meeting's. Filled in before any
+    // meeting (or since a start that didn't happen), it is meant for this one and is kept.
+    if (Finished != null) {
+      context = new MeetingContext();
+      Raise(nameof(Context));
+    }
     contextDelay?.Cancel();
     MinutesContext = null;
     Entries.Clear();
@@ -150,8 +267,11 @@ public sealed class SessionController : Observable {
     bookmarks.Clear();
     Questions.Clear();
     Finished = null;
+    ClearWarnings();
     minutesWarning = AppSettings.Shared.MinutesProblem(mode);
-    Warning = minutesWarning;
+    UpdateWarning();
+    finalWritten = false;
+    keepRecordingFolder = false;
     Minutes = null;
     MinutesDraft = null;
     warnedAboutSilence = false;
@@ -161,8 +281,8 @@ public sealed class SessionController : Observable {
     try {
       if (mode == MeetingMode.Translate) {
         if (config.Target == null || Languages.Same(config.Spoken, config.Target))
-          throw new SessionException($"Nothing to translate: the meeting is already in {Languages.Name(config.Spoken)}.",
-            "Choose another spoken or target language in Settings → Translate.");
+          throw new SessionException($"People speak {Languages.Name(config.Spoken)}, the language you translate into, so there's nothing to translate.",
+            "In Settings → Translate, set \"People speak\" to the meeting's language, or use Transcribe Meeting.");
         if (Languages.Route(config.Spoken, config.Target) == null)
           throw new SessionException($"There's no translation model from {Languages.Name(config.Spoken)} to {Languages.Name(config.Target)}.",
             "Choose another target language in Settings → Translate.");
@@ -185,11 +305,18 @@ public sealed class SessionController : Observable {
       engine = new SpeechEngine(Task.Run(() => new Recognizer(threads)));
       engine.Recognized += (job, text, words) => Ui.Post(() => OnRecognized(id, job, text, words));
       engine.LoadFailed += e => Ui.Post(() => {
-        if (id == sessionId) Warning = $"Speech recognition couldn't be loaded: {e.Message}";
+        if (id != sessionId) return;
+        loadWarning = $"Speech recognition couldn't be loaded: {e.Message}";
+        UpdateWarning();
       });
       if (mode == MeetingMode.Translate) {
         translatorTask = Task.Run(() => new TranslationService(config.Spoken, config.Target!, 2));
         translationWorker = new TranslationWorker(translatorTask);
+        translationWorker.LoadFailed += e => Ui.Post(() => {
+          if (id != sessionId) return;
+          translationWarning = $"The translation couldn't be loaded: {e.Message} The transcript goes on without it.";
+          UpdateWarning();
+        });
       }
 
       recordingFolder = Path.Combine(Paths.Recordings, Guid.NewGuid().ToString());
@@ -200,36 +327,51 @@ public sealed class SessionController : Observable {
           (start, samples) => engine.SubmitFinal(kind, start, samples),
           config.ProvisionalSeconds > 0 ? (start, samples) => engine.SubmitPartial(kind, start, samples) : null);
         vads[kind] = vad;
-        tracks[kind] = new Track(kind, Path.Combine(recordingFolder, $"{kind.Key()}.wav"), vad.Feed);
+        var track = new Track(kind, Path.Combine(recordingFolder, $"{kind.Key()}.wav"), vad.Feed, vad.Flush);
+        track.WriteFailed += e => Ui.Post(() => {
+          if (id != sessionId) return;
+          recordingWarning = $"The recording can't be written any more ({e.Message}). The transcript goes on without it.";
+          UpdateWarning();
+        });
+        tracks[kind] = track;
       }
       if (testAudio != null) {
+        // When the file ends the recording goes on, as on the Mac: stop it like any meeting.
         var file = new FileSource(testAudio, tracks[AudioSourceKind.System].Append);
-        file.Finished += () => Ui.Post(async () => {
-          if (id == sessionId && IsRecording) await Stop();
-        });
+        file.Finished += () => Log.Write("replay: the file has ended; still recording");
         sources[AudioSourceKind.System] = file;
       } else {
         var meeting = WasapiSource.MeetingAudio(config.MeetingDeviceId, tracks[AudioSourceKind.System].Append);
+        Watch(meeting, AudioSourceKind.System, id);
         Log.Write($"meeting audio from the {(config.MeetingDeviceId.Length > 0 ? "chosen" : "default")} output device");
         sources[AudioSourceKind.System] = meeting;
       }
       if (tracks.TryGetValue(AudioSourceKind.Microphone, out var micTrack)) {
         try {
-          sources[AudioSourceKind.Microphone] = WasapiSource.Microphone(config.MicDeviceId, micTrack.Append);
+          var microphone = WasapiSource.Microphone(config.MicDeviceId, micTrack.Append);
+          Watch(microphone, AudioSourceKind.Microphone, id);
+          sources[AudioSourceKind.Microphone] = microphone;
           Log.Write($"microphone: the {(config.MicDeviceId.Length > 0 ? "chosen" : "default")} device");
-        } catch (Exception e) when (e is UnauthorizedAccessException || (e is COMException c && (uint)c.HResult == 0x80070005)) {
-          throw new SessionException("Kurzschrift isn't allowed to use the microphone.",
-            "Turn on Settings → Privacy & security → Microphone → \"Let desktop apps access your microphone\", " +
-            "or switch off \"Include my microphone\" in Kurzschrift's settings.");
+        } catch (Exception e) {
+          DropMicrophone(config, e);
         }
       }
       var start = DateTime.Now;
-      foreach (var s in sources.Values) s.Start();
+      clock.Restart();
+      sources[AudioSourceKind.System].Start();
+      if (sources.TryGetValue(AudioSourceKind.Microphone, out var mic)) {
+        try {
+          mic.Start();
+        } catch (Exception e) {
+          DropMicrophone(config, e);
+        }
+      }
 
       document = new TranscriptDocument(config, start) { Context = context };
-      document.WriteDraft(Entries);
+      Recovery.WriteSidecar(recordingFolder, document.FilePath, config, start);
+      WriteDraft(null);
       StartedAt = start;
-      lastSpeechAt = start;
+      lastSpeechAt = Now;
       AutoStopIn = null;
       ElapsedSeconds = 0;
       SetPhase(Phase.Recording);
@@ -248,7 +390,7 @@ public sealed class SessionController : Observable {
         Minutes = new MinutesState("", AppSettings.Shared.Provider) { UsesAI = false };
       }
       ContextChanged();
-      Log.Write($"recording: sources=[{string.Join(", ", kinds.Select(k => k.Key()))}] language={config.Spoken}" +
+      Log.Write($"recording: sources=[{string.Join(", ", tracks.Keys.Select(k => k.Key()))}] language={config.Spoken}" +
                 (config.Target != null ? $" target={config.Target}" : ""));
     } catch (Exception e) {
       Log.Write($"start failed: {e.Message}");
@@ -261,6 +403,12 @@ public sealed class SessionController : Observable {
 
   // MARK: Stop
 
+  /// In the first version of the final file, which is written before the minutes and the recording
+  /// are done; it only stays in the file if Kurzschrift is closed before they are.
+  const string StillSavingNote = "Kurzschrift was still writing the minutes or saving the recording when this version of the file was written.";
+
+  /// Stops recording and saves. Always ends idle with everything torn down. What can't be saved
+  /// where it belongs is kept in the Unsaved folder, and the user is told through ErrorOccurred.
   public async Task Stop() {
     if (phase != Phase.Recording || config is not { } cfg || document is not { } doc) {
       Log.Write($"stop ignored: phase is {phase}");
@@ -268,129 +416,209 @@ public sealed class SessionController : Observable {
     }
     Log.Write($"stop: {segments.Count} segments so far");
     SetPhase(Phase.Finishing, "Finishing transcription…");
-    FinishEditingMinutes();
-    AutoStopIn = null;
-    tick?.Stop();
-    foreach (var s in sources.Values) s.Stop();
-    var vadList = vads.Values.ToList();
-    var eng = engine;
-    var tw = translationWorker;
-    await Task.Run(() => {
-      foreach (var v in vadList) v.Flush();
-      eng?.Finish();
-    });
-    foreach (var t in tracks.Values) t.Close();
-    await Task.Run(() => tw?.Drain());
-    await Dispatcher.Yield(DispatcherPriority.Background);  // let the last results land
-    Partials.Clear();
-    minutesRunner?.Stop();
-    var endedAt = DateTime.Now;
-    Log.Write($"speech finished: {segments.Count} segments");
+    string? failure = null;
+    var where = new List<string>();
+    string? rescueAs = null;
+    FinishedMeeting? f = null;
+    try {
+      FinishEditingMinutes();
+      AutoStopIn = null;
+      tick?.Stop();
+      foreach (var s in sources.Values) s.Stop();
+      var trackList = tracks.Values.ToList();
+      var eng = engine;
+      var tw = translationWorker;
+      await Task.Run(() => {
+        // Closing a track finishes its speech detector under the track's lock, so a capture or
+        // timer callback that is still running can't be feeding the detector at the same time.
+        foreach (var t in trackList) t.Close();
+        eng?.Finish();
+      });
+      await Task.Run(() => tw?.Drain());
+      await Dispatcher.Yield(DispatcherPriority.Background);  // let the last results land
+      Partials.Clear();
+      minutesRunner?.Stop();
+      var endedAt = DateTime.Now;
+      Log.Write($"speech finished: {segments.Count} segments");
 
-    var notes = new List<string>();
-    var speakers = new Dictionary<AudioSourceKind, List<SpeakerSpan>>();
-    var voices = new Dictionary<string, float[]>();
-    if (cfg.SeparateSpeakers && ModelStore.Speakers.Installed) {
-      var toDiarize = new List<AudioSourceKind>();
-      if (segments.Any(s => s.Source == AudioSourceKind.System)) toDiarize.Add(AudioSourceKind.System);
-      if (cfg.MicShared && segments.Any(s => s.Source == AudioSourceKind.Microphone)) toDiarize.Add(AudioSourceKind.Microphone);
-      foreach (var source in toDiarize) {
-        if (!tracks.TryGetValue(source, out var track)) continue;
-        SetPhase(Phase.Finishing, "Identifying speakers…");
-        try {
-          var result = await Diarization.Speakers(track.FilePath);
-          speakers[source] = result.Spans;
-          foreach (var (sid, v) in result.Voices) voices[$"{source.Key()}:{sid}"] = v;
-          Log.Write($"diarized {source.Key()}: {result.Spans.Count} spans, {result.Spans.Select(s => s.Speaker).Distinct().Count()} speakers");
-        } catch (Exception e) {
-          Log.Write($"diarization failed: {e.Message}");
-          notes.Add($"Speakers couldn't be identified: {e.Message}");
+      var notes = new List<string>();
+      var speakers = new Dictionary<AudioSourceKind, List<SpeakerSpan>>();
+      var voices = new Dictionary<string, float[]>();
+      if (cfg.SeparateSpeakers && ModelStore.Speakers.Installed) {
+        var toDiarize = new List<AudioSourceKind>();
+        if (segments.Any(s => s.Source == AudioSourceKind.System)) toDiarize.Add(AudioSourceKind.System);
+        if (cfg.MicShared && segments.Any(s => s.Source == AudioSourceKind.Microphone)) toDiarize.Add(AudioSourceKind.Microphone);
+        foreach (var source in toDiarize) {
+          if (!tracks.TryGetValue(source, out var track)) continue;
+          SetPhase(Phase.Finishing, "Identifying speakers…");
+          try {
+            var result = await Diarization.Speakers(track.FilePath, Diarization.Timeout(track.Duration));
+            speakers[source] = result.Spans;
+            foreach (var (sid, v) in result.Voices) voices[$"{source.Key()}:{sid}"] = v;
+            Log.Write($"diarized {source.Key()}: {result.Spans.Count} spans, {result.Spans.Select(s => s.Speaker).Distinct().Count()} speakers");
+          } catch (Exception e) {
+            Log.Write($"diarization failed: {e.Message}");
+            notes.Add($"Speakers couldn't be identified: {e.Message}");
+          }
         }
       }
-    }
-    var same = Diarization.SameVoices(voices);
-    if (same.Count > 0) Log.Write($"{same.Count} microphone speaker(s) are people in the meeting audio");
-    var known = AppSettings.Shared.RecognizeVoices
-      ? VoiceLibrary.Match(voices.Where(kv => !same.ContainsKey(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value))
-      : new();
-    if (known.Count > 0) Log.Write($"recognized {known.Count} known voice(s)");
-    var (turns, speakerNames) = TranscriptBuilder.Build(segments, speakers, cfg, known, same);
-    var voicesByName = new Dictionary<string, float[]>();
-    foreach (var (label, name) in speakerNames) if (voices.TryGetValue(label, out var v)) voicesByName[name] = v;
+      var same = Diarization.SameVoices(voices);
+      if (same.Count > 0) Log.Write($"{same.Count} microphone speaker(s) are people in the meeting audio");
+      var known = AppSettings.Shared.RecognizeVoices
+        ? VoiceLibrary.Match(voices.Where(kv => !same.ContainsKey(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value))
+        : new();
+      if (known.Count > 0) Log.Write($"recognized {known.Count} known voice(s)");
+      var (turns, speakerNames) = TranscriptBuilder.Build(segments, speakers, cfg, known, same);
+      var voicesByName = new Dictionary<string, float[]>();
+      foreach (var (label, name) in speakerNames) if (voices.TryGetValue(label, out var v)) voicesByName[name] = v;
 
-    if (translatorTask != null && cfg.Target != null) {
-      SetPhase(Phase.Finishing, "Translating transcript…");
-      try {
-        var translator = await translatorTask;
-        await Task.Run(() => {
-          foreach (var turn in turns) {
-            var parts = new List<string>();
-            for (int i = 0; i < turn.Pieces.Count; i++) {
-              var lang = i < turn.Languages.Count ? turn.Languages[i] : "";
-              parts.Add(Languages.Same(lang, cfg.Target) ? turn.Pieces[i] : translator.Translate(turn.Pieces[i]));
+      if (translatorTask != null && cfg.Target != null) {
+        SetPhase(Phase.Finishing, "Translating transcript…");
+        try {
+          var translator = await translatorTask;
+          await Task.Run(() => {
+            foreach (var turn in turns) {
+              var parts = new List<string>();
+              for (int i = 0; i < turn.Pieces.Count; i++) {
+                var lang = i < turn.Languages.Count ? turn.Languages[i] : "";
+                parts.Add(Languages.Same(lang, cfg.Target) ? turn.Pieces[i] : translator.Translate(turn.Pieces[i]));
+              }
+              turn.Translation = string.Join(" ", parts);
             }
-            turn.Translation = string.Join(" ", parts);
+          });
+        } catch (Exception e) {
+          Log.Write($"translating the transcript failed: {e.Message}");
+          notes.Add($"The transcript couldn't be translated: {e.Message}");
+        }
+      }
+
+      // The finished transcript goes to disk now, with the minutes as they stand. The final minutes
+      // and the recording can take minutes more (a slow network, a long meeting); if the PC is shut
+      // down meanwhile, the transcript with its speakers is already there.
+      contextDelay?.Cancel();
+      doc.Context = context;
+      var runner = minutesRunner;
+      bool finalMinutesWanted = runner != null && turns.Count > 0;
+      f = new FinishedMeeting {
+        Document = doc, Turns = turns, EndedAt = endedAt, Notes = notes,
+        Minutes = string.IsNullOrEmpty(Minutes?.Text) ? null : Minutes!.Text,  // live minutes, or your own notes
+        Bookmarks = bookmarks.ToList(), Config = cfg, Voices = voicesByName, Questions = Questions.ToList(),
+      };
+      if (finalMinutesWanted || cfg.KeepAudio) {
+        notes.Add(StillSavingNote);
+        finalWritten = true;
+        WriteFinished(f);
+        notes.Remove(StillSavingNote);
+        Log.Write($"transcript written: {turns.Count} turns; {(finalMinutesWanted ? "minutes" : "")}{(finalMinutesWanted && cfg.KeepAudio ? " and " : "")}{(cfg.KeepAudio ? "recording" : "")} to follow");
+      }
+
+      if (runner != null) {
+        if (finalMinutesWanted) {
+          SetPhase(Phase.Finishing, "Writing minutes…");
+          var text = await runner.FinalizeAsync(MinutesTranscript(turns, bookmarks));
+          if (text != null) {
+            f.Minutes = text;
+          } else {
+            var why = runner.State.Error ?? "unknown error";
+            const string prefix = "Final minutes failed: ";
+            if (why.StartsWith(prefix, StringComparison.Ordinal)) why = why[prefix.Length..];
+            f.MinutesFailed = true;
+            f.MinutesNote = f.Minutes != null
+              ? $"The final minutes couldn't be written ({why}); these are the last live minutes."
+              : $"The final minutes couldn't be written ({why}).";
+            notes.Add(f.MinutesNote);
           }
-        });
-      } catch (Exception e) {
-        Log.Write($"translating the transcript failed: {e.Message}");
-        notes.Add($"The transcript couldn't be translated: {e.Message}");
+          if (cfg.KeepAudio) {
+            notes.Add(StillSavingNote);
+            WriteFinished(f);
+            notes.Remove(StillSavingNote);
+          }
+        }
+        MinutesContext = context;
       }
-    }
 
-    string? finalMinutes = null;
-    if (minutesRunner != null) {
-      SetPhase(Phase.Finishing, "Writing minutes…");
-      finalMinutes = await minutesRunner.FinalizeAsync(MinutesTranscript(turns, bookmarks));
-      MinutesContext = context;
-      if (finalMinutes == null && !string.IsNullOrEmpty(Minutes?.Text)) {
-        finalMinutes = Minutes!.Text;
-        notes.Add($"The final minutes couldn't be written ({Minutes.Error ?? "unknown error"}); these are the last live minutes.");
+      if (cfg.KeepAudio) {
+        SetPhase(Phase.Finishing, "Saving the recording…");
+        foreach (var (source, track) in tracks.OrderBy(kv => kv.Key)) {
+          var name = source == AudioSourceKind.System ? "meeting audio" : "microphone";
+          var basePath = Path.Combine(cfg.SaveFolder, $"{doc.BaseName} ({name})");
+          var saved = await Task.Run(() => KeptRecording.Save(track.FilePath, basePath, cfg.AudioBitrate));
+          if (saved != null) {
+            f.AudioFiles.Add(saved);
+            continue;
+          }
+          // Not next to the transcript: keep it in the Unsaved folder rather than lose it.
+          var rescued = await Task.Run(() => KeptRecording.Rescue(track.FilePath, $"{doc.BaseName} ({name})"));
+          if (rescued != null) notes.Add($"The recording ({name}) couldn't be saved next to this transcript. It is in {rescued}.");
+          where.Add($"The recording ({name}) is in {rescued ?? track.FilePath}.");
+          if (rescued == null) keepRecordingFolder = true;
+        }
       }
-    } else if (!string.IsNullOrEmpty(Minutes?.Text)) {
-      finalMinutes = Minutes!.Text;  // your own notes
-    }
 
-    var audioFiles = new List<string>();
-    if (cfg.KeepAudio) {
-      SetPhase(Phase.Finishing, "Saving the recording…");
-      foreach (var (source, track) in tracks.OrderBy(kv => kv.Key)) {
-        var name = source == AudioSourceKind.System ? "meeting audio" : "microphone";
-        var basePath = Path.Combine(cfg.SaveFolder, $"{doc.BaseName} ({name})");
-        var saved = await Task.Run(() => KeptRecording.Save(track.FilePath, basePath, cfg.AudioBitrate));
-        if (saved != null) audioFiles.Add(saved);
+      foreach (var q in Questions) if (!f.Questions.Contains(q)) f.Questions.Add(q);
+      Finished = f;
+      lastFinished = f;
+      if (f.Minutes != null && Minutes != null) Minutes = Minutes with { Text = f.Minutes };
+      finalWritten = true;
+      bool written = WriteFinished(f);
+      LastTranscript = doc.SavedPath ?? doc.FilePath;
+      if (written) {
+        Log.Write($"saved {Path.GetFileName(doc.FilePath)}: {turns.Count} turns");
+        if (where.Count > 0) failure = $"The recording couldn't be saved to {cfg.SaveFolder}.";
+      } else {
+        Log.Write($"not saved to the transcripts folder: {turns.Count} turns, {(doc.SavedPath != null ? "kept in the Unsaved folder" : "no copy could be written")}");
+        failure = $"The meeting couldn't be saved to {cfg.SaveFolder}{(doc.WriteError != null ? $" ({doc.WriteError})" : "")}.";
+        where.Insert(0, doc.SavedPath != null
+          ? $"The transcript is in {doc.SavedPath}."
+          : "The transcript couldn't be written anywhere. It is still in the meeting window: save it now with Export Transcript in the menu.");
       }
+      Entries.Clear();
+      foreach (var e in turns.Select(t => new LiveEntry {
+                 Source = AudioSourceKind.System, Speaker = t.Speaker, Start = t.Start, Original = t.Text, Translation = t.Translation,
+               }).Concat(bookmarks.Select(BookmarkEntry)).OrderBy(e => e.Start))
+        Entries.Add(e);
+    } catch (Exception e) {
+      // Whatever went wrong, the draft or the first final version is on disk; keep the recording too.
+      Log.Write($"stop failed: {e.GetType().Name}: {e.Message}");
+      failure = $"The meeting couldn't be finished properly ({e.Message}).";
+      if (f != null) {
+        try {
+          WriteFinished(f);
+          Finished = f;
+          lastFinished = f;
+        } catch (Exception again) {
+          Log.Write($"writing the transcript after the failure failed too: {again.Message}");
+        }
+      }
+      LastTranscript = doc.SavedPath ?? doc.FilePath;
+      where.Insert(0, $"The transcript {(f != null ? "" : "so far ")}is in {doc.SavedPath ?? doc.FilePath}.");
+      if (cfg.KeepAudio || f == null) rescueAs = doc.BaseName;
+    } finally {
+      foreach (var path in await TearDown(rescueAs)) where.Add($"The recording is in {path}.");
+      SetPhase(Phase.Idle);
     }
-    contextDelay?.Cancel();
-    doc.Context = context;
-    Finished = new FinishedMeeting {
-      Document = doc, Turns = turns, EndedAt = endedAt, Notes = notes, AudioFiles = audioFiles, Minutes = finalMinutes,
-      Bookmarks = bookmarks.ToList(), Config = cfg, Voices = voicesByName,
-    };
-    if (finalMinutes != null && Minutes != null) Minutes = Minutes with { Text = finalMinutes };
-    RewriteFinished();
-    Log.Write($"saved {Path.GetFileName(doc.FilePath)}: {turns.Count} turns");
-    LastTranscript = doc.FilePath;
-    Entries.Clear();
-    foreach (var e in turns.Select(t => new LiveEntry {
-               Source = AudioSourceKind.System, Speaker = t.Speaker, Start = t.Start, Original = t.Text, Translation = t.Translation,
-             }).Concat(bookmarks.Select(BookmarkEntry)).OrderBy(e => e.Start))
-      Entries.Add(e);
-    await TearDown();
-    SetPhase(Phase.Idle);
+    if (failure != null) {
+      Log.Write("save problem reported to the user");
+      ErrorOccurred?.Invoke(failure, string.Join("\n", where));
+    }
   }
 
-  async Task TearDown() {
+  /// Never throws. `rescueAs`: the meeting didn't finish properly, so its recordings go to the
+  /// Unsaved folder under this name instead of being deleted; returns where they are.
+  async Task<List<string>> TearDown(string? rescueAs = null) {
+    var kept = new List<string>();
     tick?.Stop();
     tick = null;
-    minutesRunner?.Stop();
+    try { minutesRunner?.Stop(); } catch { }
     minutesRunner = null;
     foreach (var s in sources.Values) {
       try { s.Dispose(); } catch { }
     }
     sources.Clear();
-    foreach (var t in tracks.Values) t.Close();
+    var trackList = tracks.Values.ToList();
+    foreach (var t in trackList) t.Close(finishSpeech: false);
     tracks.Clear();
+    var vadList = vads.Values.ToList();
     vads.Clear();
     var eng = engine;
     engine = null;
@@ -398,18 +626,45 @@ public sealed class SessionController : Observable {
     translationWorker = null;
     var tt = translatorTask;
     translatorTask = null;
-    await Task.Run(() => {
-      eng?.Dispose();
-      tw?.Dispose();
-      try { if (tt is { IsCompletedSuccessfully: true }) tt.Result.Dispose(); } catch { }
-    });
+    try {
+      await Task.Run(() => {
+        try { eng?.Dispose(); } catch { }
+        try { tw?.Dispose(); } catch { }
+        try { if (tt is { IsCompletedSuccessfully: true }) tt.Result.Dispose(); } catch { }
+        // The tracks are closed, so nothing feeds the speech detectors any more.
+        foreach (var v in vadList) {
+          try { v.Dispose(); } catch { }
+        }
+      });
+    } catch (Exception e) {
+      Log.Write($"tearing down failed: {e.Message}");
+    }
     document = null;
     sessionId = Guid.NewGuid();
-    if (recordingFolder != null) {
-      try { Directory.Delete(recordingFolder, true); } catch { }
-    }
+    var folder = recordingFolder;
     recordingFolder = null;
+    if (folder != null) {
+      bool keep = keepRecordingFolder;
+      if (rescueAs != null) {
+        foreach (var t in trackList) {
+          if (!File.Exists(t.FilePath)) continue;
+          var name = t.Kind == AudioSourceKind.System ? "meeting audio" : "microphone";
+          var rescued = KeptRecording.Rescue(t.FilePath, $"{rescueAs} ({name})");
+          kept.Add(rescued ?? t.FilePath);
+          if (rescued == null) keep = true;
+        }
+      }
+      if (keep) {
+        Log.Write("the recording folder is kept: not everything in it could be saved elsewhere");
+      } else {
+        try { Directory.Delete(folder, true); } catch { }
+      }
+    }
+    keepRecordingFolder = false;
+    clock.Stop();
+    ClearWarnings(keepMinutes: true);
     GC.Collect();
+    return kept;
   }
 
   // MARK: Live results
@@ -417,7 +672,7 @@ public sealed class SessionController : Observable {
   void OnRecognized(Guid id, SpeechEngine.Job job, string text, List<TimedWord> words) {
     if (id != sessionId || config is not { } cfg || phase is not (Phase.Recording or Phase.Finishing)) return;
     if (text.Length > 0) {
-      lastSpeechAt = DateTime.Now;
+      lastSpeechAt = Now;
       AutoStopIn = null;
     }
     var speaker = cfg.IncludeMic ? (job.Source == AudioSourceKind.Microphone ? cfg.MyName : "Others") : null;
@@ -451,7 +706,7 @@ public sealed class SessionController : Observable {
     };
     RepairPunctuation(segment);
     if (segment.Text.Length == 0) return;
-    Log.Write(FormattableString.Invariant($"final {segment.Source.Key()} {segment.Start:F1}-{segment.End:F1}: {segment.Text.Length} chars"));
+    Log.Write(FormattableString.Invariant($"final {segment.Source.Key()} {segment.Start:F1}-{segment.End:F1}: {segment.Text.Length} chars, {segment.Words.Count} words"));
     segments.Add(segment);
     var entry = new LiveEntry { Id = segment.Id, Source = segment.Source, Speaker = speaker, Start = segment.Start, Original = segment.Text };
     if (cfg.Target != null) {
@@ -461,12 +716,12 @@ public sealed class SessionController : Observable {
         translationWorker?.Final(segment.Text, t => Ui.Post(() => {
           if (id != sessionId) return;
           entry.Translation = t;
-          document?.WriteDraft(Entries, Minutes?.Text);
+          WriteDraft(Minutes?.Text);
         }));
       }
     }
     if (Insert(entry, segment)) minutesRunner?.Add(MinutesLine(segment, speaker));
-    document?.WriteDraft(Entries, Minutes?.Text);
+    WriteDraft(Minutes?.Text);
   }
 
   static string MinutesLine(FinalSegment s, string? speaker) =>
@@ -507,16 +762,19 @@ public sealed class SessionController : Observable {
   }
 
   void Tick() {
-    if (phase != Phase.Recording || startedAt is not DateTime start) return;
-    ElapsedSeconds = (int)(DateTime.Now - start).TotalSeconds;
+    if (phase != Phase.Recording) return;
+    ElapsedSeconds = (int)Now;
     CheckAutoStop();
-    if (!warnedAboutSilence && ElapsedSeconds >= 20 && tracks.TryGetValue(AudioSourceKind.System, out var sys) && !sys.HasSignal) {
+    if (!tracks.TryGetValue(AudioSourceKind.System, out var sys)) return;
+    if (!warnedAboutSilence && ElapsedSeconds >= 20 && !sys.HasSignal) {
       warnedAboutSilence = true;
-      Warning = "No meeting audio received yet. Kurzschrift records what plays on Windows' default output device: " +
-                "if the meeting plays on another one (a headset), make that the default in Windows' sound settings.";
-    } else if (Warning != null && Warning != minutesWarning && tracks.TryGetValue(AudioSourceKind.System, out var s2) && s2.HasSignal &&
-               Warning.StartsWith("No meeting audio")) {
-      Warning = null;
+      silenceWarning = "No meeting audio received yet. Kurzschrift records what plays on the output device chosen in " +
+                       "Settings → General → Audio devices (Windows' default output unless you chose another). If the meeting " +
+                       "plays on a different device, such as a headset, choose it there or make it Windows' default.";
+      UpdateWarning();
+    } else if (silenceWarning != null && sys.HasSignal) {
+      silenceWarning = null;
+      UpdateWarning();
     }
   }
 
@@ -525,7 +783,7 @@ public sealed class SessionController : Observable {
   void CheckAutoStop() {
     double limit = AppSettings.Shared.AutoStopMinutes * 60;
     if (limit <= 0 || !IsRecording) return;
-    double quiet = (DateTime.Now - lastSpeechAt).TotalSeconds;
+    double quiet = Now - lastSpeechAt;
     if (quiet >= limit) {
       Log.Write($"auto-stop after {(int)quiet} s without speech");
       AutoStopIn = null;
@@ -538,7 +796,7 @@ public sealed class SessionController : Observable {
   }
 
   public void KeepRecording() {
-    lastSpeechAt = DateTime.Now;
+    lastSpeechAt = Now;
     AutoStopIn = null;
   }
 
@@ -548,8 +806,8 @@ public sealed class SessionController : Observable {
   }
 
   public void AddBookmark() {
-    if (!IsRecording || startedAt is not DateTime start) return;
-    double time = (DateTime.Now - start).TotalSeconds;
+    if (!IsRecording) return;
+    double time = Now;
     bookmarks.Add(time);
     int index = 0;
     for (int i = Entries.Count - 1; i >= 0; i--) {
@@ -557,7 +815,7 @@ public sealed class SessionController : Observable {
     }
     Entries.Insert(index, BookmarkEntry(time));
     minutesRunner?.Add(BookmarkLine(time));
-    document?.WriteDraft(Entries, Minutes?.Text);
+    WriteDraft(Minutes?.Text);
     BookmarkAdded?.Invoke();
     Log.Write($"bookmark at {(int)time} s");
   }
@@ -571,9 +829,16 @@ public sealed class SessionController : Observable {
 
   /// Writes the finished meeting's file again with its current speaker names and questions.
   public void RewriteFinished() {
-    if (Finished is not { } f) return;
-    var qa = Questions.Where(q => q.Answer != null).Select(q => (q.Question, q.Answer!)).ToList();
-    f.Document.WriteFinal(f.Turns, f.EndedAt, f.Notes, f.AudioFiles, f.Minutes, f.Bookmarks, qa);
+    if (Finished is { } f) WriteFinished(f);
+  }
+
+  /// Writes a finished meeting's file with what it holds now. False when it couldn't be written to
+  /// the transcripts folder (it is then in the Unsaved folder; see TranscriptDocument.SavedPath).
+  bool WriteFinished(FinishedMeeting f) {
+    var qa = f.Questions.Where(q => q.Answer != null).Select(q => (q.Question, q.Answer!)).ToList();
+    bool ok = f.Document.WriteFinal(f.Turns, f.EndedAt, f.Notes, f.AudioFiles, f.Minutes, f.Bookmarks, qa);
+    if (f == Finished) LastTranscript = f.Document.SavedPath ?? f.Document.FilePath;
+    return ok;
   }
 
   /// The speaker names of the finished meeting, for renaming.
@@ -608,9 +873,10 @@ public sealed class SessionController : Observable {
     var s = AppSettings.Shared;
     var item = new QAItem { Question = question };
     Questions.Add(item);
+    Finished?.Questions.Add(item);  // asked after the meeting: it goes into that meeting's file
     var key = ApiKeyStore.Key(s.Provider);
     if (key == null || string.IsNullOrWhiteSpace(s.MinutesModel)) {
-      item.Error = $"No {s.Provider.DisplayName()} API key or model is set (Settings → Minutes).";
+      item.Error = key == null ? "No API key is set (Settings → Minutes)." : "No model is chosen (Settings → Minutes).";
       return;
     }
     var transcript = string.Join("\n", Entries.Select(e => e.IsBookmark
@@ -625,7 +891,10 @@ public sealed class SessionController : Observable {
         Ui.Post(() => {
           item.Answer = result.Text;
           Log.Write($"question answered, usage in={result.Usage.Input} out={result.Usage.Output}");
-          if (IsIdle) RewriteFinished();
+          // Into the file of the meeting it was asked about, even if the next one has started.
+          // (While that meeting is still running, saving it picks the answer up.)
+          var owner = new[] { Finished, lastFinished }.FirstOrDefault(m => m != null && m.Questions.Contains(item));
+          if (owner != null) WriteFinished(owner);
         });
       } catch (Exception e) {
         Ui.Post(() => item.Error = e.Message);
@@ -639,7 +908,9 @@ public sealed class SessionController : Observable {
     bool textChanged = state.Text != Minutes?.Text;
     Minutes = state;
     Raise(nameof(CanRedoMinutes));
-    if (textChanged && phase == Phase.Recording) document?.WriteDraft(Entries, state.Text);
+    Raise(nameof(CanRetryMinutes));
+    Raise(nameof(CanEditMinutes));
+    if (textChanged && phase == Phase.Recording) WriteDraft(state.Text);
   }
 
   public void UpdateMinutesNow() => minutesRunner?.UpdateNow();
@@ -656,17 +927,22 @@ public sealed class SessionController : Observable {
   public void StartAIMinutes() {
     var meetingConfig = IsRecording ? config : Finished?.Config;
     if (!CanStartAIMinutes || meetingConfig == null) return;
-    var mc = AppSettings.Shared.MinutesConfigFor(meetingConfig.Mode, evenIfOff: true);
+    var mc = AppSettings.Shared.MinutesConfigFor(meetingConfig.Mode, evenIfOff: true, spoken: meetingConfig.Spoken);
     if (mc == null) return;
     FinishEditingMinutes();
     var notes = Minutes?.Text ?? "";
     var id = sessionId;
     var runner = new MinutesRunner(mc);
-    runner.StateChanged += state => Ui.Post(() => { if (id == sessionId || IsIdle) MinutesChanged(state); });
+    // After the meeting the pane follows this runner only while that meeting is still the one shown.
+    var shown = IsRecording ? null : Finished;
+    runner.StateChanged += state => Ui.Post(() => {
+      if (shown != null ? Finished == shown : id == sessionId) MinutesChanged(state);
+    });
     runner.MeetingContext = context.PromptText;
     if (notes.Length > 0) runner.FinishEditing(notes);
     Minutes = runner.State;
-    if (Warning == minutesWarning) Warning = null;
+    minutesWarning = null;
+    UpdateWarning();
     Log.Write($"AI minutes switched on {(IsRecording ? "during" : "after")} the meeting, notes: {(notes.Length == 0 ? "none" : "yes")}");
     if (IsRecording) {
       config!.Minutes = mc;
@@ -682,10 +958,11 @@ public sealed class SessionController : Observable {
         var text = await runner.FinalizeAsync(MinutesTranscript(f.Turns, f.Bookmarks));
         if (text == null) return;  // the error shows in the pane; your notes stay as they were
         Ui.Post(() => {
+          // Into the meeting they were written for, even if the next one has started meanwhile.
           f.Document.UsesAIMinutes = true;
           f.Minutes = text;
-          MinutesContext = used;
-          RewriteFinished();
+          if (Finished == f) MinutesContext = used;
+          WriteFinished(f);
         });
       });
     }
@@ -700,23 +977,47 @@ public sealed class SessionController : Observable {
   /// current minutes, with the new context.
   public void RedoMinutes() {
     if (!CanRedoMinutes || Finished is not { } f) return;
-    var mc = AppSettings.Shared.MinutesConfigFor(f.Config.Mode, evenIfOff: true);
+    Log.Write("minutes redone with a changed context");
+    WriteFinalMinutesAgain(f);
+  }
+
+  /// After the meeting, when its final minutes couldn't be written (no network, a rejected key,
+  /// an answer that was cut off): "Try Again" in the minutes pane.
+  public bool CanRetryMinutes =>
+    IsIdle && Finished is { MinutesFailed: true } && Minutes is { UsesAI: true, IsUpdating: false } && CanAsk;
+
+  public void RetryMinutes() {
+    if (!CanRetryMinutes || Finished is not { } f) return;
+    Log.Write("final minutes tried again");
+    WriteFinalMinutesAgain(f);
+  }
+
+  /// Final minutes for a finished meeting once more, from its whole transcript, the minutes it has
+  /// and the current context.
+  void WriteFinalMinutesAgain(FinishedMeeting f) {
+    var mc = AppSettings.Shared.MinutesConfigFor(f.Config.Mode, evenIfOff: true, spoken: f.Config.Spoken);
     if (mc == null) return;
     FinishEditingMinutes();
-    var doc = f.Document;
     var runner = new MinutesRunner(mc, f.Minutes);
-    runner.StateChanged += state => Ui.Post(() => { if (Finished?.Document == doc) MinutesChanged(state); });
+    runner.StateChanged += state => Ui.Post(() => { if (Finished == f) MinutesChanged(state); });
     runner.MeetingContext = context.PromptText;
     var used = context;
     Minutes = runner.State;
-    Log.Write("minutes redone with a changed context");
     _ = Task.Run(async () => {
       var text = await runner.FinalizeAsync(MinutesTranscript(f.Turns, f.Bookmarks));
       Ui.Post(() => {
-        if (text == null || Finished?.Document != doc) return;
+        if (text == null) return;  // the error shows in the pane; it can be tried again
+        // Into the meeting they were written for, even if the next one has started meanwhile.
         f.Minutes = text;
-        MinutesContext = used;
-        RewriteFinished();
+        f.Document.UsesAIMinutes = true;
+        f.MinutesFailed = false;
+        if (f.MinutesNote != null) f.Notes.Remove(f.MinutesNote);
+        f.MinutesNote = null;
+        if (Finished == f) {
+          MinutesContext = used;
+          Raise(nameof(CanRetryMinutes));
+        }
+        WriteFinished(f);
       });
     });
   }
@@ -726,9 +1027,14 @@ public sealed class SessionController : Observable {
     string.Join("\n", turns.Select(t => (t.Start, Line: $"[{TranscriptDocument.Clock(t.Start)}] {t.Speaker ?? "Speaker"}: {t.Text}"))
       .Concat(marks.Select(b => (Start: b, Line: BookmarkLine(b)))).OrderBy(x => x.Start).Select(x => x.Line));
 
+  /// Not while the meeting is being saved or final minutes are on their way: they would replace
+  /// what you typed, or your "Done" would replace them.
+  public bool CanEditMinutes =>
+    Minutes != null && phase is Phase.Recording or Phase.Idle && !(IsIdle && Minutes is { UsesAI: true, IsUpdating: true });
+
   public void BeginEditingMinutes() {
-    if (Minutes == null || MinutesDraft != null) return;
-    MinutesDraft = Minutes.Text;
+    if (Minutes is not { } current || !CanEditMinutes || MinutesDraft != null) return;
+    MinutesDraft = current.Text;
     minutesRunner?.BeginEditing();
   }
 
@@ -740,7 +1046,7 @@ public sealed class SessionController : Observable {
       minutesRunner.FinishEditing(draft);
     } else if (phase != Phase.Idle && Minutes != null) {
       Minutes = Minutes with { Text = draft };
-      document?.WriteDraft(Entries, draft);
+      WriteDraft(draft);
     } else if (Finished is { } f && Minutes != null && draft != Minutes.Text) {
       f.Minutes = draft;
       Minutes = Minutes with { Text = draft };
@@ -770,7 +1076,7 @@ public sealed class SessionController : Observable {
       if (minutesRunner != null) minutesRunner.MeetingContext = context.PromptText;
       if (document != null) {
         document.Context = context;
-        document.WriteDraft(Entries, Minutes?.Text);
+        WriteDraft(Minutes?.Text);
       }
     } else if (IsIdle && Finished is { } f) {
       f.Document.Context = context;
@@ -823,6 +1129,9 @@ public sealed class TranslationWorker : IDisposable {
   bool stopped, draining;
   int busy;
 
+  /// The model couldn't be loaded; nothing will be translated. Raised on the worker thread.
+  public event Action<Exception>? LoadFailed;
+
   public TranslationWorker(Task<TranslationService> loading) {
     this.loading = loading;
     worker = new Thread(Run) { IsBackground = true, Name = "translation" };
@@ -859,6 +1168,7 @@ public sealed class TranslationWorker : IDisposable {
     } catch (Exception e) {
       Log.Write($"loading translation failed: {e.Message}");
       lock (gate) { stopped = true; Monitor.PulseAll(gate); }
+      try { LoadFailed?.Invoke(e); } catch { }
       return;
     }
     while (true) {

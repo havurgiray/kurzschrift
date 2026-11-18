@@ -46,11 +46,13 @@ public static class MinutesProviderExtensions {
   public static string OverrideVariable(this MinutesProvider provider) =>
     "KURZSCHRIFT_MINUTES_BASE_URL_" + provider.RawValue().ToUpperInvariant();
 
+  /// Only while Settings → Advanced allows developer links: a variable in the environment alone
+  /// must not be able to send the transcript and the API key somewhere else.
   public static bool IsOverridden(this MinutesProvider provider) =>
-    Environment.GetEnvironmentVariable(provider.OverrideVariable()) != null;
+    AppSettings.Shared.DeveloperLinks && Environment.GetEnvironmentVariable(provider.OverrideVariable()) != null;
 
   public static Uri BaseUrl(this MinutesProvider provider) {
-    var value = Environment.GetEnvironmentVariable(provider.OverrideVariable());
+    var value = provider.IsOverridden() ? Environment.GetEnvironmentVariable(provider.OverrideVariable()) : null;
     if (value != null && Uri.TryCreate(value, UriKind.Absolute, out var url)) return url;
     return provider switch {
       MinutesProvider.Anthropic => new Uri("https://api.anthropic.com"),
@@ -63,6 +65,8 @@ public static class MinutesProviderExtensions {
     foreach (var provider in All) {
       if (provider.IsOverridden()) {
         Log.Write($"testing override: {provider.RawValue()} requests go to {provider.BaseUrl().OriginalString}");
+      } else if (Environment.GetEnvironmentVariable(provider.OverrideVariable()) != null) {
+        Log.Write($"testing override ignored: {provider.OverrideVariable()} is set, but developer links are off (Settings → Advanced)");
       }
     }
   }

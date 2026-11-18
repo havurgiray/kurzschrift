@@ -89,22 +89,52 @@ public sealed class App : Application {
 
     var session = SessionController.Shared;
     session.ModelsNeeded = models => DownloadWindow.Run(models);
-    session.ShowWindowRequested += () => LiveWindow.ShowShared();
+    // A meeting that starts (shortcut, call prompt, link) shows its window without taking the keyboard.
+    session.ShowWindowRequested += () => LiveWindow.ShowShared(activate: false);
     session.ErrorOccurred += (message, suggestion) =>
       MessageBox.Show(suggestion.Length > 0 ? $"{message}\n\n{suggestion}" : message, "Kurzschrift",
         MessageBoxButton.OK, MessageBoxImage.Warning);
     session.BookmarkAdded += () => System.Media.SystemSounds.Asterisk.Play();
 
     Tray = new TrayIcon();
+    // Signing out, shutting down or restarting Windows (and an installer closing the app) must not
+    // cut a meeting off: hold Windows back, save the same way Quit does, then leave.
+    SessionEnding += (_, ending) => {
+      if (session.IsIdle) {
+        session.FinishEditingMinutes();
+        AppSettings.Shared.Flush();
+        return;
+      }
+      ending.Cancel = true;
+      Log.Write($"Windows is ending the session ({ending.ReasonSessionEnding}) during a meeting: saving first");
+      BlockShutdown("Kurzschrift is saving the meeting.");
+      Quit();
+    };
+    // A meeting that never finished saving (crash, power loss, forced quit) left its recording behind.
+    var leftovers = Recovery.Leftovers();
+    if (leftovers.Count > 0) {
+      _ = Task.Run(() => Recovery.Recover(leftovers)).ContinueWith(t => Dispatcher.BeginInvoke(() => {
+        if (t.IsCompletedSuccessfully && t.Result is { } found)
+          Tray?.ShowBalloon(found.Meetings == 1 ? "The last meeting didn't finish saving" : $"{found.Meetings} meetings didn't finish saving",
+            $"The transcript so far and the recording are in {found.Folder}.");
+      }));
+    }
     HotKeys.Apply(AppSettings.Shared.GlobalShortcuts);
     AppSettings.Shared.PropertyChanged += (_, p) => {
       if (p.PropertyName == nameof(AppSettings.GlobalShortcuts)) HotKeys.Apply(AppSettings.Shared.GlobalShortcuts);
       if (p.PropertyName == nameof(AppSettings.MinutesIntervalMinutes)) session.MinutesIntervalChanged();
       if (p.PropertyName is nameof(AppSettings.Subtitles) or nameof(AppSettings.SubtitlesAtTop)) SubtitlesWindow.Update();
       if (p.PropertyName == nameof(AppSettings.DetectCalls)) CallDetector.Apply();
+      if (p.PropertyName == nameof(AppSettings.CheckForUpdates)) UpdateChecker.Apply(AppSettings.Shared.CheckForUpdates);
     };
     CallDetector.Apply();
+    // The subtitles come and go with the meeting. (Listening for that inside the subtitles window
+    // only worked once the window existed, so subtitles switched on before a meeting never appeared.)
+    session.PropertyChanged += (_, p) => {
+      if (p.PropertyName == nameof(SessionController.Phase)) SubtitlesWindow.Update();
+    };
     SubtitlesWindow.Update();
+    UpdateChecker.Apply(AppSettings.Shared.CheckForUpdates);
     Program.Listen(args => Dispatcher.BeginInvoke(() => HandleArgs(args)));
 
     bool firstRun = !File.Exists(Paths.SettingsFile);
@@ -126,12 +156,43 @@ public sealed class App : Application {
     }
   }
 
+  System.Windows.Interop.HwndSource? shutdownWindow;
+  bool quitting;
+
+  /// Tells Windows why the app isn't closing yet (shown on its "closing apps" screen).
+  void BlockShutdown(string reason) {
+    try {
+      shutdownWindow ??= new System.Windows.Interop.HwndSource(
+        new System.Windows.Interop.HwndSourceParameters("Kurzschrift") { WindowStyle = 0, Width = 0, Height = 0 });
+      ShutdownBlockReasonCreate(shutdownWindow.Handle, reason);
+    } catch (Exception e) {
+      Log.Write($"shutdown block reason: {e.Message}");
+    }
+  }
+
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+  static extern bool ShutdownBlockReasonCreate(IntPtr hWnd, string reason);
+
+  [DllImport("user32.dll")]
+  static extern bool ShutdownBlockReasonDestroy(IntPtr hWnd);
+
   /// Quitting mid-meeting saves the transcript first.
   public async void Quit() {
+    if (quitting) return;
+    quitting = true;
     var session = SessionController.Shared;
-    while (!session.IsIdle) {
-      if (session.IsRecording) await session.Stop(); else await Task.Delay(200);
+    try {
+      session.FinishEditingMinutes();  // notes still being typed after a meeting go into its file
+      while (!session.IsIdle) {
+        if (session.IsRecording) await session.Stop(); else await Task.Delay(200);
+      }
+    } catch (Exception e) {
+      Log.Write($"saving before quitting failed: {e.Message}");
     }
+    if (shutdownWindow != null) {
+      try { ShutdownBlockReasonDestroy(shutdownWindow.Handle); } catch { }
+    }
+    AppSettings.Shared.Flush();
     Tray?.Dispose();
     HotKeys.Apply(false);
     Log.Write("quit");
@@ -141,9 +202,12 @@ public sealed class App : Application {
 }
 
 /// kurzschrift://start?mode=translate|transcribe, kurzschrift://stop, kurzschrift://toggle?mode=…,
+/// (with mode=transcribe, language=second starts the menu's second Transcribe entry),
 /// kurzschrift://bookmark, kurzschrift://minutes, kurzschrift://ask?q=…, kurzschrift://rename?from=…&to=….
 /// The developer links (start?audio=, snapshot, edit-minutes, window, context) only work while
 /// Settings → Advanced allows them, because any web page can try to open a kurzschrift:// link.
+/// For the same reason ask, rename, and minutes when it would start or redo AI minutes need
+/// "Allow links to ask questions, start AI minutes and rename speakers" there.
 public static class Links {
   public static async Task Handle(string link) {
     if (!Uri.TryCreate(link, UriKind.Absolute, out var uri)) return;
@@ -162,16 +226,27 @@ public static class Links {
       return;
     }
     var s = SessionController.Shared;
+    // These send the transcript to the AI provider or change the saved file. "minutes" for minutes
+    // that are already running only brings their next update forward, so that stays open.
+    bool automation = action is "ask" or "rename" ||
+                      (action == "minutes" && (s.CanStartAIMinutes || s.CanRetryMinutes || s.CanRedoMinutes));
+    if (automation && !AppSettings.Shared.AutomationLinks) {
+      Log.Write("url ignored: automation links are off (Settings → Advanced)");
+      return;
+    }
     switch (action) {
       case "start":
-        if (mode is { } m) await s.Start(m, Q("audio"));
+        if (mode is { } m) await s.Start(m, Q("audio"), Q("language") == "second");
         break;
       case "stop": await s.Stop(); break;
       case "toggle":
-        if (s.IsRecording) await s.Stop(); else if (mode is { } m2) await s.Start(m2);
+        if (s.IsRecording) await s.Stop(); else if (mode is { } m2) await s.Start(m2, secondLanguage: Q("language") == "second");
         break;
       case "minutes":
-        if (s.CanStartAIMinutes) s.StartAIMinutes(); else if (s.CanRedoMinutes) s.RedoMinutes(); else s.UpdateMinutesNow();
+        if (s.CanStartAIMinutes) s.StartAIMinutes();
+        else if (s.CanRetryMinutes) s.RetryMinutes();
+        else if (s.CanRedoMinutes) s.RedoMinutes();
+        else s.UpdateMinutesNow();
         break;
       case "bookmark": s.AddBookmark(); break;
       case "ask":
@@ -182,7 +257,9 @@ public static class Links {
         break;
       case "snapshot":
         if (Q("path") is { } path && path.EndsWith(".png", StringComparison.OrdinalIgnoreCase)) {
-          if (Q("window") == "subtitles") SubtitlesWindow.Snapshot(path); else LiveWindow.Snapshot(path);
+          if (Q("window") == "subtitles") SubtitlesWindow.Snapshot(path);
+          else if (Q("window") == "settings") SettingsWindow.Snapshot(Q("tab") ?? "General", path);
+          else LiveWindow.Snapshot(path);
         }
         break;
       case "edit-minutes":
@@ -191,6 +268,7 @@ public static class Links {
           case "cancel": s.CancelEditingMinutes(); break;
           default:
             s.BeginEditingMinutes();
+            if (s.MinutesDraft == null) break;  // not editable right now (the meeting is being saved)
             if (Q("text") is { } text) s.MinutesDraft = text;
             s.FinishEditingMinutes();
             break;

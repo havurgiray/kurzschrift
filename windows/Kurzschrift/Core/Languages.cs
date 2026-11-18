@@ -6,13 +6,13 @@ namespace Kurzschrift;
 /// small word-list language guess (to leave text alone that's already in the target language).
 public static class Languages {
   /// Parakeet TDT 0.6B v3: 25 European languages, recognized without being told which.
-  public static readonly (string Code, string Name)[] Spoken = {
+  public static readonly (string Code, string Name)[] Spoken = new (string Code, string Name)[] {
     ("bg", "Bulgarian"), ("hr", "Croatian"), ("cs", "Czech"), ("da", "Danish"), ("nl", "Dutch"),
     ("en", "English"), ("et", "Estonian"), ("fi", "Finnish"), ("fr", "French"), ("de", "German"),
     ("el", "Greek"), ("hu", "Hungarian"), ("it", "Italian"), ("lv", "Latvian"), ("lt", "Lithuanian"),
     ("mt", "Maltese"), ("pl", "Polish"), ("pt", "Portuguese"), ("ro", "Romanian"), ("sk", "Slovak"),
     ("sl", "Slovenian"), ("es", "Spanish"), ("sv", "Swedish"), ("ru", "Russian"), ("uk", "Ukrainian"),
-  };
+  }.OrderBy(l => l.Name, StringComparer.Ordinal).ToArray();
 
   /// OPUS-MT pairs with a quantized ONNX export (Xenova) and SentencePiece files (Helsinki-NLP),
   /// checked on 2026-11-14.

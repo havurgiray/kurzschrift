@@ -43,6 +43,9 @@ public sealed class OpusModel : IDisposable {
   static readonly HashSet<string> Abbreviations = new(StringComparer.OrdinalIgnoreCase) {
     "z.B", "bzw", "ca", "Dr", "Nr", "usw", "etc", "ggf", "inkl", "evtl", "Mio", "Mrd", "Prof", "Hr", "Fr", "St",
     "vgl", "d.h", "u.a", "z.T", "Abs", "Bd", "S", "Mag", "Ing", "DI",
+    // English, and titles in the other languages Parakeet writes down
+    "Mr", "Mrs", "Ms", "Jr", "Sr", "vs", "Inc", "Ltd", "Corp", "Co", "e.g", "i.e", "approx", "Gov", "Gen", "Col", "Lt",
+    "Sgt", "Capt", "Mt", "Ave", "U.S", "U.K", "Mme", "Mlle", "Sra", "Srta", "Sig", "Dott", "dhr", "mevr", "bijv",
   };
 
   /// Splits at . ! ? followed by a space and a capital letter, but not after an ordinal ("30.")
@@ -94,7 +97,8 @@ public sealed class OpusModel : IDisposable {
 
   public string Decode(IEnumerable<int> ids) {
     var sb = new StringBuilder();
-    foreach (var id in ids) if (id != eos && id != pad && id < idToPiece.Length) sb.Append(idToPiece[id]);
+    // <unk> is left out too, as Hugging Face's decoder does (skip_special_tokens): it isn't text.
+    foreach (var id in ids) if (id != eos && id != pad && id != unk && id < idToPiece.Length) sb.Append(idToPiece[id]);
     return sb.ToString().Replace('▁', ' ').Trim();
   }
 

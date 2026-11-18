@@ -38,6 +38,8 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 LicenseFile=..\..\LICENSE
+; Shown after the license: no warranty, and what the person recording is responsible for.
+InfoBeforeFile=notice.txt
 CloseApplications=yes
 AppMutex=Local\Kurzschrift-single-instance
 
@@ -45,7 +47,9 @@ AppMutex=Local\Kurzschrift-single-instance
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "startup"; Description: "Start Kurzschrift when I sign in to Windows"; Flags: unchecked
+; Only offered on a first install: afterwards "Start Kurzschrift when I sign in to Windows" in the
+; app's settings owns the Run value, and an update must not switch it back on.
+Name: "startup"; Description: "Start Kurzschrift when I sign in to Windows"; Flags: unchecked; Check: IsFirstInstall
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 
 [Files]
@@ -64,7 +68,8 @@ Root: HKCU; Subkey: "Software\Classes\kurzschrift"; ValueType: string; ValueName
 Root: HKCU; Subkey: "Software\Classes\kurzschrift"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
 Root: HKCU; Subkey: "Software\Classes\kurzschrift\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\Kurzschrift.exe"",0"
 Root: HKCU; Subkey: "Software\Classes\kurzschrift\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\Kurzschrift.exe"" ""%1"""
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Kurzschrift"; ValueData: """{app}\Kurzschrift.exe"" --background"; Flags: uninsdeletevalue; Tasks: startup
+; The Run value is removed at uninstall in [Code], whoever created it (this task or the app's setting).
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Kurzschrift"; ValueData: """{app}\Kurzschrift.exe"" --background"; Tasks: startup; Check: IsFirstInstall
 
 [Run]
 Filename: "{app}\Kurzschrift.exe"; Description: "Start Kurzschrift"; Flags: nowait postinstall skipifsilent
@@ -72,3 +77,19 @@ Filename: "{app}\Kurzschrift.exe"; Description: "Start Kurzschrift"; Flags: nowa
 [UninstallDelete]
 ; Settings, models and transcripts stay; only the program goes.
 Type: dirifempty; Name: "{app}"
+
+[Code]
+// True when Kurzschrift isn't installed for this user yet (no uninstall entry of this AppId).
+function IsFirstInstall: Boolean;
+begin
+  Result := not RegKeyExists(HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6C1E3E7A-3F4B-4E2E-9B7D-4B5D2A8C9F11}_is1');
+end;
+
+// "Start when I sign in" may have been switched on in the app's settings rather than here, so the
+// Run value is removed at uninstall in every case; otherwise it would point at a program that's gone.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RegDeleteValue(HKEY_CURRENT_USER, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Kurzschrift');
+end;

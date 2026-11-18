@@ -12,14 +12,19 @@ using Microsoft.Win32;
 namespace Kurzschrift;
 
 /// The meeting window: the transcript as people speak, with Minutes, Ask and Context beside it;
-/// or a small bar with the clock and the latest line.
+/// or a small bar with the clock and the latest line. It floats above other windows, like the
+/// Mac's panel, and doesn't take the keyboard when a meeting starts.
 public partial class LiveWindow : Window {
   static LiveWindow? shared;
   static string? pendingTab;
   readonly SessionController session = SessionController.Shared;
+  readonly System.Windows.Threading.DispatcherTimer captionTimer = new() { Interval = TimeSpan.FromMilliseconds(300) };
   bool updatingContext;
   bool paneOpen = true;
-  double fullHeight = 660, fullWidth = 980;
+  /// Which shape the window has now (null before the first ApplySize), and whether we're moving it ourselves.
+  bool? small;
+  bool placing;
+  bool wasEditing;
 
   public LiveWindow() {
     InitializeComponent();
@@ -27,24 +32,33 @@ public partial class LiveWindow : Window {
     session.PropertyChanged += SessionChanged;
     AppSettings.Shared.PropertyChanged += SettingsChanged;
     session.Entries.CollectionChanged += EntriesChanged;
-    session.Partials.CollectionChanged += (_, _) => { ScrollToEndIfFollowing(); UpdateSmallLine(); };
+    session.Partials.CollectionChanged += (_, _) => { ScrollToEndIfFollowing(); UpdateStatus(); };
     Closing += (_, e) => {
       if (!App.ShuttingDown) {
         e.Cancel = true;
         Hide();
       }
     };
+    LocationChanged += (_, _) => RememberBounds();
+    SizeChanged += (_, _) => RememberBounds();
+    captionTimer.Tick += (_, _) => UpdateSmallLine();
+    IsVisibleChanged += (_, _) => UpdateCaptionTimer();
     ApplyFonts();
     UpdateAll();
     if (pendingTab != null) SelectTabNow(pendingTab);
   }
 
-  public static void ShowShared() {
+  /// `activate` false: a meeting started by itself (shortcut, call prompt, link) shows the window
+  /// without taking the keyboard away from the app you're in.
+  public static void ShowShared(bool activate = true) {
     shared ??= new LiveWindow();
     shared.ApplySize();
-    if (!shared.IsVisible) shared.Show();
+    if (!shared.IsVisible) {
+      shared.ShowActivated = activate;
+      shared.Show();
+    }
     if (shared.WindowState == WindowState.Minimized) shared.WindowState = WindowState.Normal;
-    shared.Activate();
+    if (activate) shared.Activate();
   }
 
   public static void SelectTab(string tab) {
@@ -67,16 +81,22 @@ public partial class LiveWindow : Window {
       return;
     }
     w.UpdateLayout();
-    var element = (FrameworkElement)w.Content;
-    var dpi = VisualTreeHelper.GetDpi(w);
-    var bmp = new RenderTargetBitmap((int)(element.ActualWidth * dpi.DpiScaleX), (int)(element.ActualHeight * dpi.DpiScaleY),
+    Render((FrameworkElement)w.Content, w, path);
+  }
+
+  /// Draws one of the app's own views into a PNG (never the screen). Through a brush, so the view
+  /// lands at the picture's corner whatever margin it has in its window.
+  public static void Render(FrameworkElement element, Window window, string path) {
+    var dpi = VisualTreeHelper.GetDpi(window);
+    var bmp = new RenderTargetBitmap((int)Math.Ceiling(element.ActualWidth * dpi.DpiScaleX), (int)Math.Ceiling(element.ActualHeight * dpi.DpiScaleY),
       dpi.PixelsPerInchX, dpi.PixelsPerInchY, PixelFormats.Pbgra32);
-    var bg = new DrawingVisual();
-    using (var dc = bg.RenderOpen()) {
-      dc.DrawRectangle(w.Background ?? Brushes.White, null, new Rect(0, 0, element.ActualWidth, element.ActualHeight));
+    var picture = new DrawingVisual();
+    using (var dc = picture.RenderOpen()) {
+      var area = new Rect(0, 0, element.ActualWidth, element.ActualHeight);
+      dc.DrawRectangle(window.Background ?? Brushes.White, null, area);
+      dc.DrawRectangle(new VisualBrush(element) { Stretch = Stretch.None, AlignmentX = AlignmentX.Left, AlignmentY = AlignmentY.Top }, null, area);
     }
-    bmp.Render(bg);
-    bmp.Render(element);
+    bmp.Render(picture);
     var enc = new PngBitmapEncoder();
     enc.Frames.Add(BitmapFrame.Create(bmp));
     using var f = File.Create(path);
@@ -87,7 +107,7 @@ public partial class LiveWindow : Window {
   public static void SaveAs(bool markdown) {
     var s = SessionController.Shared;
     var dlg = new SaveFileDialog {
-      FileName = s.IsRecording ? $"{s.ExportBaseName} (as of {DateTime.Now:HH-mm})" : s.ExportBaseName,
+      FileName = s.IsRecording ? FormattableString.Invariant($"{s.ExportBaseName} (as of {DateTime.Now:HH-mm})") : s.ExportBaseName,
       DefaultExt = markdown ? ".md" : ".txt",
       Filter = markdown ? "Markdown|*.md" : "Text|*.txt",
       InitialDirectory = s.ExportFolder ?? "",
@@ -101,33 +121,51 @@ public partial class LiveWindow : Window {
     }
   }
 
+  /// The clipboard can be held by another app for a moment; that must not become an error dialog.
+  public static void Copy(string text) {
+    try {
+      Clipboard.SetText(text);
+    } catch (Exception e) {
+      Log.Write($"copying to the clipboard failed: {e.Message}");
+    }
+  }
+
   // Updates
 
   void SessionChanged(object? sender, PropertyChangedEventArgs e) {
     switch (e.PropertyName) {
       case nameof(SessionController.ElapsedSeconds):
+        UpdateStatus();
+        UpdateMinutesStatus();
+        break;
       case nameof(SessionController.Phase):
       case nameof(SessionController.PhaseText):
       case nameof(SessionController.Finished):
       case nameof(SessionController.LastTranscript):
         UpdateStatus();
         UpdateMinutes();
+        UpdateContextPane();
         break;
       case nameof(SessionController.Minutes):
       case nameof(SessionController.MinutesDraft):
       case nameof(SessionController.CanStartAIMinutes):
       case nameof(SessionController.CanRedoMinutes):
+      case nameof(SessionController.CanRetryMinutes):
+      case nameof(SessionController.CanEditMinutes):
         UpdateMinutes();
         UpdateContextPane();
         break;
       case nameof(SessionController.Context):
         UpdateContextPane();
+        UpdateMinutes();
         break;
       case nameof(SessionController.AutoStopIn):
-        AutoStopText.Text = session.AutoStopIn is int n ? $"No speech for a while: stopping and saving in {n} s." : "";
+        AutoStopText.Text = session.AutoStopIn is int n ? $"No speech: stopping in {n} s" : "";
+        UpdateSmallLine();
         break;
       case nameof(SessionController.Config):
         ApplyFonts();
+        UpdateStatus();
         break;
     }
   }
@@ -135,6 +173,7 @@ public partial class LiveWindow : Window {
   void SettingsChanged(object? sender, PropertyChangedEventArgs e) {
     if (e.PropertyName == nameof(AppSettings.LiveWindowSmall)) ApplySize();
     if (e.PropertyName == nameof(AppSettings.LiveFontSize)) ApplyFonts();
+    if (e.PropertyName == nameof(AppSettings.GlobalShortcuts)) UpdateStatus();
   }
 
   void UpdateAll() {
@@ -148,15 +187,18 @@ public partial class LiveWindow : Window {
     StatusText.Text = session.Phase switch {
       Phase.Recording => session.ElapsedText,
       Phase.Starting or Phase.Finishing => session.PhaseText,
-      _ => session.Finished != null ? "Saved" : "Kurzschrift",
+      _ => session.Finished != null ? "Saved" : "Not recording",
     };
+    ModeText.Text = session.IsRecording ? session.ModeDescription : "";
     OpenButton.Visibility = session.IsIdle && session.LastTranscript != null ? Visibility.Visible : Visibility.Collapsed;
     EmptyText.Text = session.Entries.Count > 0 || session.Partials.Count > 0 ? "" : session.Phase switch {
-      Phase.Recording => "Listening… Text appears here as people speak.",
+      Phase.Recording => "The transcript appears here as people speak.",
       Phase.Starting => session.PhaseText,
       Phase.Finishing => session.PhaseText,
-      _ => "Start a meeting from the speech bubble in the notification area,\nor with Ctrl+Alt+T (translate) or Ctrl+Alt+R (transcribe).",
+      _ => "Start a meeting with the Start button or from the speech bubble in the notification area" +
+           (AppSettings.Shared.GlobalShortcuts ? ",\nor with Ctrl+Alt+T (translate) or Ctrl+Alt+R (transcribe)." : "."),
     };
+    BookmarkButton.ToolTip = AppSettings.Shared.GlobalShortcuts ? "Mark this moment as important (Ctrl+Alt+B)" : "Mark this moment as important";
     Title = session.IsRecording ? $"Kurzschrift · {session.ElapsedText}" : "Kurzschrift";
     UpdateSmallLine();
   }
@@ -167,52 +209,140 @@ public partial class LiveWindow : Window {
     Resources["MainSize"] = size;
     Resources["OriginalSize"] = translate ? Math.Max(10, size - 3) : size;
     Resources["OriginalOpacity"] = translate ? 0.65 : 1.0;
+    // The headings above each line, and everything in the side pane, follow the text size too.
+    Resources["HeadingSize"] = Math.Max(10, size - 3);
+    Resources["SideSize"] = Math.Max(10, size - 1);
+    MinutesView.FontSize = MinutesBox.FontSize = MinutesEmpty.FontSize = QuestionBox.FontSize = Math.Max(10, size - 1);
     SmallLine.FontSize = size;
+    SmallOriginal.FontSize = Math.Max(10, size - 2);
+  }
+
+  // Size and place: remembered across launches, separately for the window and the bar
+
+  static bool ParseBounds(string text, out Rect bounds) {
+    bounds = default;
+    var parts = text.Split(',');
+    var n = new double[4];
+    if (parts.Length != 4) return false;
+    for (int i = 0; i < 4; i++)
+      if (!double.TryParse(parts[i], NumberStyles.Float, CultureInfo.InvariantCulture, out n[i])) return false;
+    if (n[2] < 200 || n[3] < 40) return false;
+    bounds = new Rect(n[0], n[1], n[2], n[3]);
+    // Only if it is still on a screen (a monitor may have gone since).
+    var screens = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+      SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+    var visible = Rect.Intersect(screens, bounds);
+    return !visible.IsEmpty && visible.Width >= 100 && visible.Height >= 40;
+  }
+
+  void RememberBounds() {
+    if (placing || small == null || !IsLoaded || !IsVisible || WindowState != WindowState.Normal) return;
+    var text = FormattableString.Invariant($"{Left:0},{Top:0},{ActualWidth:0},{ActualHeight:0}");
+    if (small == true) AppSettings.Shared.LiveBarBounds = text; else AppSettings.Shared.LiveWindowBounds = text;
   }
 
   void ApplySize() {
-    bool small = AppSettings.Shared.LiveWindowSmall;
-    if (small) {
-      if (Body.Visibility == Visibility.Visible && IsLoaded) {
-        fullHeight = ActualHeight;
-        fullWidth = ActualWidth;
-      }
+    bool wanted = AppSettings.Shared.LiveWindowSmall;
+    if (small == wanted) {
+      UpdateSmallLine();
+      return;
+    }
+    RememberBounds();  // of the shape we're leaving, so switching back returns to where it was
+    placing = true;
+    small = wanted;
+    if (wanted) {
       Body.Visibility = Visibility.Collapsed;
       PaneButton.Visibility = Visibility.Collapsed;
-      SmallLine.Visibility = Visibility.Visible;
+      ModeText.Visibility = Visibility.Collapsed;
+      SmallCaption.Visibility = Visibility.Visible;
+      MinHeight = 0;
       SizeToContent = SizeToContent.Height;
-      Topmost = true;
       SizeButton.Content = "Expand";
-      if (Width > 900) Width = 760;
+      SizeButton.ToolTip = "Back to the full window";
+      if (ParseBounds(AppSettings.Shared.LiveBarBounds, out var bar)) {
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = bar.Left;
+        Top = bar.Top;
+        Width = bar.Width;
+      } else if (Width > 900) {
+        Width = 760;
+      }
     } else {
       Body.Visibility = Visibility.Visible;
       PaneButton.Visibility = Visibility.Visible;
-      SmallLine.Visibility = Visibility.Collapsed;
+      ModeText.Visibility = Visibility.Visible;
+      SmallCaption.Visibility = Visibility.Collapsed;
       SizeToContent = SizeToContent.Manual;
-      Topmost = false;
+      MinHeight = 260;
       SizeButton.Content = "▁ Bar";
-      if (ActualHeight < 200) {
-        Height = fullHeight;
-        Width = fullWidth;
+      SizeButton.ToolTip = "Shrink to a small bar. Recording, transcript and minutes carry on.";
+      if (ParseBounds(AppSettings.Shared.LiveWindowBounds, out var full)) {
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = full.Left;
+        Top = full.Top;
+        Width = full.Width;
+        Height = Math.Max(full.Height, 260);
+      } else {
+        Width = 980;
+        Height = 660;
       }
     }
+    placing = false;
+    UpdateCaptionTimer();
     UpdateSmallLine();
   }
 
-  void UpdateSmallLine() {
-    if (!AppSettings.Shared.LiveWindowSmall) return;
-    var p = session.Partials.LastOrDefault();
-    var e = session.Entries.LastOrDefault(x => !x.IsBookmark);
-    SmallLine.Text = p != null ? (p.Translation ?? p.Original) : e != null ? (e.Translation ?? e.Original) : "";
+  void UpdateCaptionTimer() {
+    // The bar's caption follows the translation of the line in progress, which changes without the lists changing.
+    if (small == true && IsVisible) captionTimer.Start(); else captionTimer.Stop();
   }
 
+  /// The bar's caption, like the Mac's: what is being said right now; in a translated meeting the
+  /// original above, smaller, and the translation below.
+  void UpdateSmallLine() {
+    if (small != true) return;
+    string? original = null;
+    string line;
+    if (session.AutoStopIn is int n) {
+      line = $"No speech: stopping in {n} s";
+    } else if (session.IsRecording) {
+      if (session.CurrentCaption is { } now) {
+        if (session.Config?.Mode == MeetingMode.Translate) {
+          original = Tail(now.Original, 110);
+          line = now.Translation ?? "…";
+        } else {
+          line = now.Original;
+        }
+      } else {
+        line = "Listening…";
+      }
+    } else if (session.IsIdle && session.LastTranscript != null) {
+      line = Path.GetFileName(session.LastTranscript);
+    } else {
+      line = "";
+    }
+    line = Tail(line, 170);
+    if (SmallLine.Text != line) SmallLine.Text = line;
+    if (SmallOriginal.Text != (original ?? "")) SmallOriginal.Text = original ?? "";
+    SmallOriginal.Visibility = original != null ? Visibility.Visible : Visibility.Collapsed;
+  }
+
+  /// The end of a long line: that's where the talking is.
+  static string Tail(string text, int length) => text.Length > length ? "…" + text[^length..] : text;
+
   void EntriesChanged(object? sender, NotifyCollectionChangedEventArgs e) {
+    if (e.Action == NotifyCollectionChangedAction.Reset) SetFollowing(true);  // a new meeting, or the finished transcript
     UpdateStatus();
     ScrollToEndIfFollowing();
   }
 
   ScrollViewer? scroller;
   bool following = true;
+
+  void SetFollowing(bool value) {
+    following = value;
+    JumpButton.Visibility = !value && session.Entries.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+  }
 
   void ScrollToEndIfFollowing() {
     scroller ??= FindScrollViewer(EntryList);
@@ -226,7 +356,8 @@ public partial class LiveWindow : Window {
     if (scroller != null) {
       scroller.ScrollChanged += (_, args) => {
         // Follow new lines only while you're at the bottom; reading further up isn't interrupted.
-        if (args.ExtentHeightChange == 0) following = scroller.VerticalOffset >= scroller.ScrollableHeight - 40;
+        if (args.ExtentHeightChange == 0 && args.ViewportHeightChange == 0)
+          SetFollowing(scroller.VerticalOffset >= scroller.ScrollableHeight - 40);
       };
     }
   }
@@ -240,52 +371,86 @@ public partial class LiveWindow : Window {
     return null;
   }
 
+  void Jump_Click(object sender, RoutedEventArgs e) {
+    SetFollowing(true);
+    scroller?.ScrollToEnd();
+  }
+
   // Minutes pane
 
   void UpdateMinutes() {
     var m = session.Minutes;
     bool editing = session.MinutesDraft != null;
-    if (!editing) MinutesBox.Text = m?.Text ?? "";
-    MinutesBox.IsReadOnly = !editing;
+    bool notesOnly = m is { UsesAI: false };
+    MinutesTitle.Text = m == null ? "" : notesOnly ? "Notes" : "Minutes";
+    if (editing && !wasEditing) MinutesBox.Text = session.MinutesDraft ?? "";
+    wasEditing = editing;
+    var text = m?.Text ?? "";
+    if (!editing && MinutesView.Markdown != text) MinutesView.Markdown = text;
+    MinutesBox.Visibility = editing ? Visibility.Visible : Visibility.Collapsed;
+    MinutesView.Visibility = editing ? Visibility.Collapsed : Visibility.Visible;
     EditMinutesButton.Content = editing ? "Done" : "Edit";
-    EditMinutesButton.IsEnabled = m != null;
-    CancelEditButton.Visibility = editing ? Visibility.Visible : Visibility.Collapsed;
-    AIMinutesButton.Visibility = session.CanStartAIMinutes ? Visibility.Visible : Visibility.Collapsed;
-    UpdateMinutesButton.Visibility = m is { UsesAI: true } && session.IsRecording ? Visibility.Visible : Visibility.Collapsed;
-    MinutesStatus.Text = m == null ? "" : MinutesStatusText(m);
-    MinutesEmpty.Text = !string.IsNullOrEmpty(MinutesBox.Text) || editing ? "" :
+    // Not while final minutes are being written: they would replace what you typed, or your "Done" them.
+    EditMinutesButton.IsEnabled = editing || session.CanEditMinutes;
+    CancelEditButton.Visibility = Show(editing);
+    CopyMinutesButton.Visibility = Show(!editing);
+    CopyMinutesButton.IsEnabled = text.Length > 0;
+    CopyMinutesButton.ToolTip = notesOnly ? "Copy notes" : "Copy minutes";
+    AIMinutesButton.Visibility = Show(!editing && session.CanStartAIMinutes);
+    RetryMinutesButton.Visibility = Show(!editing && session.CanRetryMinutes);
+    UpdateMinutesButton.Visibility = Show(!editing && m is { UsesAI: true } && session.IsRecording);
+    UpdateMinutesButton.IsEnabled = m?.IsUpdating != true;
+    // An error stays in view while the next try is running.
+    MinutesError.Text = m?.Error ?? "";
+    MinutesError.Visibility = Show(!string.IsNullOrEmpty(m?.Error));
+    UpdateMinutesStatus();
+    MinutesEmpty.Text = text.Length > 0 || editing ? "" :
       m == null ? "Minutes appear here during a meeting." :
-      !m.UsesAI ? "Your notes: click Edit to write them; they're saved with the transcript." +
-                  (session.CanAsk ? "" : "\n\nFor AI minutes, add an API key in Settings → Minutes.") :
-      session.Context.IsEmpty ? "The first minutes arrive after a few minutes of talking.\n\nTip: tell Kurzschrift who's in the meeting and what it's about in the Context tab."
-                              : "The first minutes arrive after a few minutes of talking.";
+      notesOnly && session.CanStartAIMinutes ? (session.IsRecording
+        ? $"Press AI Minutes to have minutes written from the transcript so far and updated every {AppSettings.Shared.MinutesIntervalMinutes} min, or take your own notes with Edit."
+        : "Press AI Minutes to have minutes written from the whole transcript, or take your own notes with Edit.") :
+      notesOnly ? "Take notes with Edit; they're saved with the transcript. Add an API key in Settings → Minutes and an AI Minutes button appears here." :
+      "The first minutes appear after the first update interval, once enough has been said. You can also start them yourself with Edit." +
+      (session.Context.IsEmpty ? " Under Context, say who's in the meeting and what it's about, and the minutes use it." : "");
   }
 
-  static string MinutesStatusText(MinutesState m) {
-    if (!m.UsesAI) return "Notes";
-    if (m.IsUpdating) return "Updating…";
-    if (!string.IsNullOrEmpty(m.Error)) return m.Error!;
+  static Visibility Show(bool visible) => visible ? Visibility.Visible : Visibility.Collapsed;
+
+  void UpdateMinutesStatus() {
+    var m = session.Minutes;
+    bool editing = session.MinutesDraft != null;
+    MinutesStatus.Text = m == null ? "" : MinutesStatusText(m, editing, session.IsRecording);
+  }
+
+  static string MinutesStatusText(MinutesState m, bool editing, bool recording) {
+    if (!m.UsesAI) return editing ? "Your notes are saved with the transcript." : "";
     var parts = new List<string>();
-    if (m.UpdatedAt is { } at) parts.Add($"Updated {at.ToLocalTime():HH:mm}");
-    if (m.EditsPending) parts.Add("your edits go into the next update");
-    else if (m.NextUpdate is { } next && SessionController.Shared.IsRecording) parts.Add($"next at {next.ToLocalTime():HH:mm}");
+    if (m.IsUpdating) parts.Add("Updating…");
+    else if (recording && editing) parts.Add("Updates wait while you edit");
+    else if (recording && m.EditsPending) parts.Add("Your edits go into the next update");
+    else if (m.UpdatedAt is { } at) parts.Add(FormattableString.Invariant($"Updated {at.ToLocalTime():HH:mm}"));
+    if (recording && !editing && !m.IsUpdating && m.NextUpdate is { } next) {
+      int seconds = Math.Max(0, (int)(next - DateTimeOffset.Now).TotalSeconds);
+      parts.Add(FormattableString.Invariant($"next in {seconds / 60}:{seconds % 60:00}"));
+    }
     if (m.Model.Length > 0) parts.Add(m.Model);
-    if (m.Cost is double c && c > 0) parts.Add($"about ${c:0.00} so far");
+    if (m.Cost is double c && c > 0) parts.Add(c < 0.01 ? "< $0.01" : FormattableString.Invariant($"≈ ${c:0.00}"));
     return string.Join(" · ", parts);
   }
 
   void MinutesBox_TextChanged(object sender, TextChangedEventArgs e) {
-    if (session.MinutesDraft != null && !MinutesBox.IsReadOnly) session.MinutesDraft = MinutesBox.Text;
+    if (session.MinutesDraft != null && wasEditing) session.MinutesDraft = MinutesBox.Text;
   }
 
   void EditMinutes_Click(object sender, RoutedEventArgs e) {
     if (session.MinutesDraft == null) {
       session.BeginEditingMinutes();
-      MinutesBox.Focus();
+      UpdateMinutes();
+      if (session.MinutesDraft != null) MinutesBox.Focus();
     } else {
       session.FinishEditingMinutes();
+      UpdateMinutes();
     }
-    UpdateMinutes();
   }
 
   void CancelEdit_Click(object sender, RoutedEventArgs e) {
@@ -294,7 +459,9 @@ public partial class LiveWindow : Window {
   }
 
   void AIMinutes_Click(object sender, RoutedEventArgs e) => session.StartAIMinutes();
+  void RetryMinutes_Click(object sender, RoutedEventArgs e) => session.RetryMinutes();
   void UpdateMinutes_Click(object sender, RoutedEventArgs e) => session.UpdateMinutesNow();
+  void CopyMinutes_Click(object sender, RoutedEventArgs e) => Copy(session.Minutes?.Text ?? "");
 
   // Ask pane
 
@@ -322,7 +489,8 @@ public partial class LiveWindow : Window {
       Phase.Idle when session.Finished != null => session.CanRedoMinutes
         ? "The context changed since the minutes were written: Redo Minutes writes them again with it."
         : "Saved with the transcript.",
-      _ => "Fill this in before or during a meeting.",
+      Phase.Idle => "Fill this in before the meeting or during it: it is used by the minutes and your questions, and saved with the transcript.",
+      _ => "",
     };
   }
 
@@ -338,6 +506,21 @@ public partial class LiveWindow : Window {
   }
 
   // Buttons
+
+  /// The same entries as the notification area menu.
+  void Start_Click(object sender, RoutedEventArgs e) {
+    var settings = AppSettings.Shared;
+    var menu = new ContextMenu { PlacementTarget = StartButton, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+    void Add(string title, MeetingMode mode, bool second = false) {
+      var item = new MenuItem { Header = title };
+      item.Click += (_, _) => _ = session.Start(mode, secondLanguage: second);
+      menu.Items.Add(item);
+    }
+    Add(settings.MenuTitle(MeetingMode.Translate), MeetingMode.Translate);
+    Add(settings.MenuTitle(MeetingMode.Transcribe), MeetingMode.Transcribe);
+    if (settings.SecondTranscribeTitle is { } title) Add(title, MeetingMode.Transcribe, second: true);
+    menu.IsOpen = true;
+  }
 
   void Bookmark_Click(object sender, RoutedEventArgs e) => session.AddBookmark();
   async void Stop_Click(object sender, RoutedEventArgs e) => await session.Stop();
@@ -367,7 +550,7 @@ public partial class LiveWindow : Window {
 
   void CopyEntry_Click(object sender, RoutedEventArgs e) {
     if ((sender as FrameworkElement)?.DataContext is LiveEntry entry)
-      Clipboard.SetText(entry.Translation is { } t ? $"{entry.Original}\n{t}" : entry.Original);
+      Copy(entry.Translation is { } t ? $"{entry.Original}\n{t}" : entry.Original);
   }
 }
 
