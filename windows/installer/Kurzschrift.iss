@@ -1,12 +1,12 @@
 ; Kurzschrift for Windows installer (Inno Setup 6). Built by build.ps1:
-;   ISCC /DArch=x64|arm64 /DVersion=1.2.0 /DSource=<publish folder> installer\Kurzschrift.iss
+;   ISCC /DArch=x64|arm64 /DVersion=1.3.0 /DSource=<publish folder> installer\Kurzschrift.iss
 ; Installs for the current user only (no administrator rights needed).
 
 #ifndef Arch
   #define Arch "x64"
 #endif
 #ifndef Version
-  #define Version "1.2.0"
+  #define Version "1.3.0"
 #endif
 
 [Setup]
